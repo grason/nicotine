@@ -4,7 +4,7 @@ version = "0.6.0"
 edition = "2021"
 description = "High-performance EVE Online multiboxing tool (Linux X11/Wayland and Windows)"
 license = "MIT"
-repository = "https://github.com/isomerc/nicotine"
+repository = "https://github.com/grason/nicotine"
 
 # Binary name is capitalized so Windows users see `Nicotine.exe` in
 # Explorer (standard convention for user-facing apps like Discord.exe,

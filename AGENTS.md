@@ -2,7 +2,7 @@
 
 High-performance **EVE Online multiboxing** tool (Linux X11/Wayland + Windows).
 Rust 2021, crate `nicotine`, version in `Cargo.toml` (`0.6.0` as of this file).
-Public repo: https://github.com/isomerc/nicotine. License: MIT.
+Public repo: https://github.com/grason/nicotine. License: MIT.
 
 Grok does **not** load `GROK.md`. This file (`AGENTS.md`) is the project
 instruction file Grok injects at session start. `CLAUDE.md` is also

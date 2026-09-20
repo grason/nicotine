@@ -35,7 +35,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 ### One-Line Installer (Recommended)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/isomerc/nicotine/master/install-github.sh | bash
+curl -sSL https://raw.githubusercontent.com/grason/nicotine/master/install-github.sh | bash
 ```
 
 Then restart your terminal and run:
@@ -46,7 +46,7 @@ nicotine start    # Automatically runs in background
 ### From Source
 
 ```bash
-git clone https://github.com/isomerc/nicotine
+git clone https://github.com/grason/nicotine
 cd nicotine
 ./install-local.sh
 ```

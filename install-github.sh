@@ -1,10 +1,10 @@
 #!/bin/bash
 # Nicotine - One-line installer
-# Usage: curl -sSL https://raw.githubusercontent.com/isomerc/nicotine/main/install-github.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/grason/nicotine/master/install-github.sh | bash
 
 set -e
 
-REPO="isomerc/nicotine"
+REPO="grason/nicotine"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_NAME="nicotine"
 
