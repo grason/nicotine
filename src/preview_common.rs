@@ -48,16 +48,28 @@ pub const SNAP_THRESHOLD_PX: i32 = 12;
 /// (96 DPI); Windows scales via `px()`, Linux uses the value raw.
 pub const ALERT_BANNER_PX: i32 = 18;
 
-/// Compact DPS figure for the title row: `0`, integer below 1000,
-/// otherwise one decimal + `k`.
+/// Title-strip pixels reserved for one DPS figure (`↓10k+` / `↑10k+`).
+/// Tight: just the glyphs, no extra air. 96 DPI; Windows scales via `px()`.
+pub const DPS_SLOT_PX: i32 = 48;
+
+/// Compact DPS figure for the title row. Four characters including `k`:
+/// `0`–`999` as an integer, `1.0k`–`9.9k` from 1000–9999, then `10k+`.
 pub fn format_dps(v: f64) -> String {
     if !v.is_finite() || v < 1.0 {
         return "0".into();
     }
     if v < 1000.0 {
         format!("{}", v.round() as u32)
+    } else if v < 10_000.0 {
+        let k = v / 1000.0;
+        // 9999 rounds to 10.0k (5 chars); treat that as the cap.
+        if k >= 9.95 {
+            "10k+".into()
+        } else {
+            format!("{k:.1}k")
+        }
     } else {
-        format!("{:.1}k", v / 1000.0)
+        "10k+".into()
     }
 }
 
@@ -69,11 +81,11 @@ pub fn dps_out_label(outgoing: f64) -> String {
     format!("↑{}", format_dps(outgoing))
 }
 
-/// Title-strip / list-row label: `"Name  ·  Jita"` when a system is
+/// Title-strip / list-row label: `"Name - Jita"` when a system is
 /// known, otherwise just the character name.
 pub fn title_label(character: &str, system: Option<&str>) -> String {
     match system.filter(|s| !s.is_empty()) {
-        Some(sys) => format!("{character}  ·  {sys}"),
+        Some(sys) => format!("{character} - {sys}"),
         None => character.to_string(),
     }
 }
@@ -205,7 +217,7 @@ mod tests {
 
     #[test]
     fn title_label_with_system() {
-        assert_eq!(title_label("Alpha", Some("Jita")), "Alpha  ·  Jita");
+        assert_eq!(title_label("Alpha", Some("Jita")), "Alpha - Jita");
     }
 
     #[test]
@@ -235,7 +247,11 @@ mod tests {
     fn format_dps_thresholds() {
         assert_eq!(format_dps(0.4), "0");
         assert_eq!(format_dps(42.2), "42");
+        assert_eq!(format_dps(999.4), "999");
         assert_eq!(format_dps(1234.0), "1.2k");
+        assert_eq!(format_dps(9800.0), "9.8k");
+        assert_eq!(format_dps(10_000.0), "10k+");
+        assert_eq!(format_dps(45_000.0), "10k+");
     }
 
     #[test]

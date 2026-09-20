@@ -63,6 +63,21 @@ fn thumbnail_size_with_banner_shrinks_height() {
 }
 
 #[test]
+fn dps_slot_fits_max_in_and_out_labels() {
+    use crate::preview_common::DPS_SLOT_PX;
+    let font = jetbrains_mono();
+    for size in [13.0, 14.0] {
+        for label in ["↓10k+", "↑10k+"] {
+            let (_, w, _) = rasterize_text(font, label, size);
+            assert!(
+                (w as i32) <= DPS_SLOT_PX,
+                "{label} at {size}px is {w}px wide, slot is {DPS_SLOT_PX}"
+            );
+        }
+    }
+}
+
+#[test]
 fn thumbnail_size_floors_at_one_not_zero() {
     // Zero-dim drawables make XRender unhappy. The `.max(1)` clamp
     // on each axis is the safety floor; this catches anyone

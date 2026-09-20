@@ -3,7 +3,7 @@ use crate::cycle_state::CycleState;
 use crate::eve_logs::LogLiveState;
 use crate::preview_common::{
     dps_in_label, dps_out_label, preview_should_hide, snap_position, thumbnail_dest, title_label,
-    DragRect, DragState, ALERT_BANNER_PX, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    DragRect, DragState, ALERT_BANNER_PX, DPS_SLOT_PX, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -185,7 +185,7 @@ struct PreviewWindowState {
     /// window. Read from WM_PAINT to choose border color. Updated by
     /// reconcile via the GWLP_USERDATA pointer.
     is_active: bool,
-    /// Last title-strip label (`Name` or `Name  ·  Jita`).
+    /// Last title-strip label (`Name` or `Name - Jita`).
     title_label: String,
     /// Live alert banner text. Presence also shrinks the DWM dest rect.
     alert_text: Option<String>,
@@ -1209,20 +1209,15 @@ unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
 
     let _ = DeleteObject(chrome_brush.into());
 
-    // White centered character name (plus system) in the title strip.
-    // When DPS is live, inset the name so ↓ / ↑ on the sides don't overlap.
+    // White centered character name (plus system) in the full title
+    // strip. Same position with or without DPS so taking damage does
+    // not shift the name.
     let _ = SetBkMode(hdc, TRANSPARENT);
     let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
     let body_font = nicotine_body_font();
     let prev_font = SelectObject(hdc, body_font.into());
     let mut text: Vec<u16> = state.title_label.encode_utf16().collect();
-    let dps_side = if state.showing_dps { px(56) } else { 0 };
-    let mut text_rect = RECT {
-        left: title_strip.left + dps_side,
-        top: title_strip.top,
-        right: title_strip.right - dps_side,
-        bottom: title_strip.bottom,
-    };
+    let mut text_rect = title_strip;
     let _ = DrawTextW(
         hdc,
         &mut text,
@@ -1231,7 +1226,7 @@ unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
     );
 
     if state.showing_dps {
-        let _ = SetTextColor(hdc, NICOTINE_RED);
+        let dps_side = px(DPS_SLOT_PX);
         let mut in_buf: Vec<u16> = state.dps_in_label.encode_utf16().collect();
         let mut in_rect = RECT {
             left: title_strip.left + px(6),
@@ -1245,7 +1240,6 @@ unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
             &mut in_rect,
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
-        let _ = SetTextColor(hdc, NICOTINE_GOLD);
         let mut out_buf: Vec<u16> = state.dps_out_label.encode_utf16().collect();
         let mut out_rect = RECT {
             left: title_strip.right - dps_side,
@@ -1259,7 +1253,6 @@ unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
             &mut out_rect,
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS,
         );
-        let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
     }
 
     if let Some(alert) = &state.alert_text {

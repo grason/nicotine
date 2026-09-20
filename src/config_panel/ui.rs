@@ -450,26 +450,28 @@ fn alerts_section(panel: &Panel) -> Element<'_, Message> {
     column![
         section_header("Log Monitoring"),
         caption(
-            "Read-only tail of EVE's Chatlogs and Gamelogs. Shows each character's solar system \
-             on previews and flashes a short alert on inactive clients. Nothing is written back \
-             into the game."
+            "Read-only tail of EVE Chatlogs and Gamelogs. Preview titles show Name - System, \
+             incoming / outgoing DPS on the left and right, and a red flash when that client \
+             takes damage. Event banners sit on the preview, separate from DPS. Nothing is \
+             written back into the game."
         ),
         checkbox(logs.enabled)
             .label("Enable log monitoring")
             .on_toggle(Message::LogsEnabledToggled),
         checkbox(logs.show_system)
-            .label("Show solar system on previews and the client list")
+            .label("Show solar system on preview titles and the client list")
             .on_toggle(Message::ShowSystemToggled),
         checkbox(logs.show_dps)
-            .label("Show incoming / outgoing DPS under preview titles")
+            .label("Show incoming / outgoing DPS on preview titles")
             .on_toggle(Message::ShowDpsToggled),
         checkbox(logs.alerts_on_inactive_only)
-            .label("Alerts on inactive clients only")
+            .label("Event banners on inactive clients only")
             .on_toggle(Message::AlertsInactiveOnlyToggled),
-        checkbox(logs.alert_sound)
-            .label("Play a sound with alerts")
-            .on_toggle(Message::AlertSoundToggled),
         section_header("Alert types"),
+        caption(
+            "Each enabled type shows a short banner and gold border on that client's preview. \
+             Incoming damage flash is always on while monitoring is enabled."
+        ),
         checkbox(logs.alerts.fleet_invite)
             .label("Fleet invite")
             .on_toggle(Message::FleetInviteToggled),

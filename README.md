@@ -189,7 +189,7 @@ Previews and the list window:
 
 The Alerts tab tails EVE's Chatlogs and Gamelogs (read-only). Enable it there.
 
-- Preview title strips show `Character  ·  Jita` once a system is known
+- Preview title strips show `Character - Jita` once a system is known
 - Incoming (↓) / outgoing (↑) DPS from the combat log sit on the left and right of the preview title; they hide when idle and are not mixed with the event banners
 - Taking damage flashes that client's preview chrome red for a moment (coalesced so a volley is one pulse, not a strobe)
 - Inactive clients flash a short banner + gold border for fleet invites, follow/warp, regroups, and compression (decloak / convo / crystal-broke are off by default)

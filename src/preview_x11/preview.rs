@@ -21,7 +21,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-use crate::preview_common::thumbnail_dest;
+use crate::preview_common::{thumbnail_dest, DPS_SLOT_PX};
 
 use super::render::{
     apply_scale_transform, create_text_pixmap, jetbrains_mono, pick_visual_format, thumbnail_size,
@@ -68,7 +68,7 @@ pub(super) struct OwnedPreview {
     pub(super) title_picture: u32,
     pub(super) title_text_w: u16,
     pub(super) title_text_h: u16,
-    /// Last title-strip label we rasterized (`Name` or `Name  ·  Jita`).
+    /// Last title-strip label we rasterized (`Name` or `Name - Jita`).
     /// Rebuilt when the solar system changes.
     pub(super) title_label: String,
     /// Live alert banner text, if any. Presence also shrinks the
@@ -495,38 +495,11 @@ impl PreviewManager {
         // Composite the pre-rasterized text on top. Source is ARGB32
         // (cream RGB premultiplied with the rasterized alpha); PictOp
         // OVER blends it onto the chrome strip we just filled.
-        // With DPS on, ↓ sits left, ↑ sits right, and the name is
-        // clipped into the remaining middle so the dest rect never moves.
+        // Name is centered in the full title whether DPS is showing or
+        // not, so taking damage does not shift it.
         let baseline_y = (TITLE_STRIP_HEIGHT as i16 - preview.title_text_h as i16) / 2;
         let baseline_y = baseline_y.max(0);
-        let gap: i16 = 8;
-        let in_w = if preview.showing_dps {
-            preview.dps_in_w
-        } else {
-            0
-        };
-        let out_w = if preview.showing_dps {
-            preview.dps_out_w
-        } else {
-            0
-        };
-        let name_x = TITLE_TEXT_LEFT_PAD
-            + if preview.showing_dps {
-                in_w as i16 + gap
-            } else {
-                0
-            };
-        let name_max_w = {
-            let right = preview.width as i16
-                - BORDER_WIDTH as i16
-                - TITLE_TEXT_LEFT_PAD
-                - if preview.showing_dps {
-                    out_w as i16 + gap
-                } else {
-                    0
-                };
-            (right - name_x).max(0) as u16
-        };
+        let dest_x = (preview.width as i16 - preview.title_text_w as i16) / 2;
         conn.render_composite(
             PictOp::OVER,
             preview.title_picture,
@@ -536,9 +509,9 @@ impl PreviewManager {
             0,
             0,
             0,
-            name_x,
+            dest_x.max(0),
             baseline_y,
-            preview.title_text_w.min(name_max_w),
+            preview.title_text_w,
             preview.title_text_h.min(TITLE_STRIP_HEIGHT),
         )?;
 
@@ -561,10 +534,9 @@ impl PreviewManager {
                 )?;
             }
             if let Some(pic) = preview.dps_out_picture {
-                let tx = (preview.width as i16)
-                    - BORDER_WIDTH as i16
-                    - TITLE_TEXT_LEFT_PAD
-                    - preview.dps_out_w as i16;
+                let slot = DPS_SLOT_PX as i16;
+                let tx = preview.width as i16 - slot
+                    + (slot - preview.dps_out_w as i16).max(0);
                 let ty = (TITLE_STRIP_HEIGHT as i16 - preview.dps_out_h as i16) / 2;
                 conn.render_composite(
                     PictOp::OVER,

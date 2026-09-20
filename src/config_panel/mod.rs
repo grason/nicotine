@@ -425,7 +425,6 @@ pub(super) enum Message {
     ShowSystemToggled(bool),
     ShowDpsToggled(bool),
     AlertsInactiveOnlyToggled(bool),
-    AlertSoundToggled(bool),
     FleetInviteToggled(bool),
     FollowWarpToggled(bool),
     RegroupToggled(bool),
@@ -720,10 +719,6 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::AlertsInactiveOnlyToggled(v) => {
             panel.config.logs.alerts_on_inactive_only = v;
-            panel.touch();
-        }
-        Message::AlertSoundToggled(v) => {
-            panel.config.logs.alert_sound = v;
             panel.touch();
         }
         Message::FleetInviteToggled(v) => {
