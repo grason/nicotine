@@ -65,12 +65,23 @@ pub(super) fn marlboro() -> &'static FontRef<'static> {
 
 /// (Width, height) of the thumbnail area within a preview window.
 /// Subtracts the title strip from the top and the border on left,
-/// right, and bottom.
+/// right, and bottom. When `banner` is set, also subtracts the alert
+/// strip above the bottom border so the composite doesn't cover it.
 pub(super) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
+    thumbnail_size_with_banner(window_w, window_h, false)
+}
+
+pub(super) fn thumbnail_size_with_banner(window_w: u16, window_h: u16, banner: bool) -> (u16, u16) {
+    let extra = if banner {
+        crate::preview_common::ALERT_BANNER_PX as u16
+    } else {
+        0
+    };
     let w = window_w.saturating_sub(BORDER_WIDTH * 2);
     let h = window_h
         .saturating_sub(TITLE_STRIP_HEIGHT)
-        .saturating_sub(BORDER_WIDTH);
+        .saturating_sub(BORDER_WIDTH)
+        .saturating_sub(extra);
     (w.max(1), h.max(1))
 }
 

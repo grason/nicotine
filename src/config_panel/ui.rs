@@ -1,5 +1,5 @@
 //! View helpers for the iced config panel: the branded header/footer and
-//! the four body sections (display mode, cycle order, hotkeys, previews).
+//! the body sections (display mode, cycle order, hotkeys, previews, alerts).
 
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, radio, row, slider, text,
@@ -102,6 +102,7 @@ pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
             panel.active_tab == Tab::Characters
         ),
         tab_button("Hotkeys", Tab::Hotkeys, panel.active_tab == Tab::Hotkeys),
+        tab_button("Alerts", Tab::Alerts, panel.active_tab == Tab::Alerts),
     ]
     .spacing(4);
 
@@ -150,6 +151,7 @@ pub(super) fn tab_content(panel: &Panel) -> Element<'_, Message> {
             .into(),
         Tab::Characters => characters_section(panel),
         Tab::Hotkeys => hotkeys_section(panel),
+        Tab::Alerts => alerts_section(panel),
     };
     container(inner)
         .padding([12, 16])
@@ -436,6 +438,78 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
             "Off by default. Turn on only if you don't already remap your mouse side buttons via \
              driver software (Logi Options+, Razer Synapse, etc.)."
         ),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn alerts_section(panel: &Panel) -> Element<'_, Message> {
+    let dirs = crate::eve_logs::resolve(&panel.config.logs);
+    let logs = &panel.config.logs;
+
+    column![
+        section_header("Log Monitoring"),
+        caption(
+            "Read-only tail of EVE's Chatlogs and Gamelogs. Shows each character's solar system \
+             on previews and flashes a short alert on inactive clients. Nothing is written back \
+             into the game."
+        ),
+        checkbox(logs.enabled)
+            .label("Enable log monitoring")
+            .on_toggle(Message::LogsEnabledToggled),
+        checkbox(logs.show_system)
+            .label("Show solar system on previews and the client list")
+            .on_toggle(Message::ShowSystemToggled),
+        checkbox(logs.show_dps)
+            .label("Show incoming / outgoing DPS under preview titles")
+            .on_toggle(Message::ShowDpsToggled),
+        checkbox(logs.alerts_on_inactive_only)
+            .label("Alerts on inactive clients only")
+            .on_toggle(Message::AlertsInactiveOnlyToggled),
+        checkbox(logs.alert_sound)
+            .label("Play a sound with alerts")
+            .on_toggle(Message::AlertSoundToggled),
+        section_header("Alert types"),
+        checkbox(logs.alerts.fleet_invite)
+            .label("Fleet invite")
+            .on_toggle(Message::FleetInviteToggled),
+        checkbox(logs.alerts.follow_warp)
+            .label("Follow / warp")
+            .on_toggle(Message::FollowWarpToggled),
+        checkbox(logs.alerts.regroup)
+            .label("Regroup")
+            .on_toggle(Message::RegroupToggled),
+        checkbox(logs.alerts.compression)
+            .label("Compression cycle")
+            .on_toggle(Message::CompressionToggled),
+        checkbox(logs.alerts.decloak)
+            .label("Decloak")
+            .on_toggle(Message::DecloakToggled),
+        checkbox(logs.alerts.convo_request)
+            .label("Conversation request")
+            .on_toggle(Message::ConvoRequestToggled),
+        checkbox(logs.alerts.crystal_broke)
+            .label("Mining crystal broke")
+            .on_toggle(Message::CrystalBrokeToggled),
+        section_header("Log directories"),
+        caption(
+            "Leave blank to auto-detect (Windows Documents, or the Wine prefix of a running \
+             EVE client on Linux). Overrides are used as-is."
+        ),
+        text("Chatlogs").size(CAPTION_SIZE).color(NICOTINE_BLACK),
+        text_input("auto", &logs.chatlog_dir)
+            .on_input(Message::ChatlogDirChanged)
+            .width(Length::Fill),
+        text(format!("using {}", dirs.chatlogs.display()))
+            .size(CAPTION_SIZE)
+            .color(NICOTINE_GOLD),
+        text("Gamelogs").size(CAPTION_SIZE).color(NICOTINE_BLACK),
+        text_input("auto", &logs.gamelog_dir)
+            .on_input(Message::GamelogDirChanged)
+            .width(Length::Fill),
+        text(format!("using {}", dirs.gamelogs.display()))
+            .size(CAPTION_SIZE)
+            .color(NICOTINE_GOLD),
     ]
     .spacing(8)
     .into()

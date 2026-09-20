@@ -43,6 +43,59 @@ pub const DRAG_THRESHOLD_PX: i32 = 4;
 /// docked previews. DPI-scaled on Windows; raw on Linux.
 pub const SNAP_THRESHOLD_PX: i32 = 12;
 
+/// Height of the alert banner painted above the bottom chrome border
+/// while an inactive client has a live log alert. Reference pixels
+/// (96 DPI); Windows scales via `px()`, Linux uses the value raw.
+pub const ALERT_BANNER_PX: i32 = 18;
+
+/// Compact DPS figure for the title row: `0`, integer below 1000,
+/// otherwise one decimal + `k`.
+pub fn format_dps(v: f64) -> String {
+    if !v.is_finite() || v < 1.0 {
+        return "0".into();
+    }
+    if v < 1000.0 {
+        format!("{}", v.round() as u32)
+    } else {
+        format!("{:.1}k", v / 1000.0)
+    }
+}
+
+pub fn dps_in_label(incoming: f64) -> String {
+    format!("↓{}", format_dps(incoming))
+}
+
+pub fn dps_out_label(outgoing: f64) -> String {
+    format!("↑{}", format_dps(outgoing))
+}
+
+/// Title-strip / list-row label: `"Name  ·  Jita"` when a system is
+/// known, otherwise just the character name.
+pub fn title_label(character: &str, system: Option<&str>) -> String {
+    match system.filter(|s| !s.is_empty()) {
+        Some(sys) => format!("{character}  ·  {sys}"),
+        None => character.to_string(),
+    }
+}
+
+/// Thumbnail destination inside a preview window, in window coordinates
+/// (right/bottom exclusive). `banner` is 0 or `ALERT_BANNER_PX` (already
+/// DPI-scaled by the caller). Used by both backends so dest-rect math
+/// stays in one place — DWM must not cover the GDI banner.
+pub fn thumbnail_dest(
+    width: i32,
+    height: i32,
+    title: i32,
+    border: i32,
+    banner: i32,
+) -> (i32, i32, i32, i32) {
+    let left = border;
+    let top = title;
+    let right = (width - border).max(left + 1);
+    let bottom = (height - border - banner).max(top + 1);
+    (left, top, right, bottom)
+}
+
 /// Adjust a proposed (x, y) so the dragged window's edges snap to
 /// nearby preview windows' edges when within `snap_threshold` pixels.
 /// Each axis snaps independently so you can dock right-against-left
@@ -142,6 +195,53 @@ mod tests {
             right: left + 100,
             bottom: top + 100,
         }
+    }
+
+    #[test]
+    fn title_label_without_system_is_name_only() {
+        assert_eq!(title_label("Alpha", None), "Alpha");
+        assert_eq!(title_label("Alpha", Some("")), "Alpha");
+    }
+
+    #[test]
+    fn title_label_with_system() {
+        assert_eq!(title_label("Alpha", Some("Jita")), "Alpha  ·  Jita");
+    }
+
+    #[test]
+    fn thumbnail_dest_no_banner_matches_chrome() {
+        // 320×180 preview, 24px title, 3px border — same numbers the
+        // Windows manager uses at 96 DPI.
+        let (l, t, r, b) = thumbnail_dest(320, 180, 24, 3, 0);
+        assert_eq!((l, t, r, b), (3, 24, 317, 177));
+    }
+
+    #[test]
+    fn thumbnail_dest_banner_shrinks_bottom() {
+        let (l, t, r, b) = thumbnail_dest(320, 180, 24, 3, 18);
+        assert_eq!((l, t, r, b), (3, 24, 317, 159));
+        // Banner lives between dest.bottom and the bottom border.
+        assert_eq!(180 - 3 - 18, 159);
+    }
+
+    #[test]
+    fn thumbnail_dest_title_is_fixed_24_with_banner() {
+        // DPS lives in the 24px title, so dest.top stays 24.
+        let (l, t, r, b) = thumbnail_dest(320, 180, 24, 3, 18);
+        assert_eq!((l, t, r, b), (3, 24, 317, 159));
+    }
+
+    #[test]
+    fn format_dps_thresholds() {
+        assert_eq!(format_dps(0.4), "0");
+        assert_eq!(format_dps(42.2), "42");
+        assert_eq!(format_dps(1234.0), "1.2k");
+    }
+
+    #[test]
+    fn dps_labels() {
+        assert_eq!(dps_in_label(1200.0), "↓1.2k");
+        assert_eq!(dps_out_label(840.0), "↑840");
     }
 
     #[test]

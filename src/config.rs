@@ -164,6 +164,94 @@ pub struct Config {
     pub window_width: u32,
     #[serde(default = "default_window_height")]
     pub window_height: u32,
+    /// EVE chatlog / gamelog monitoring. Nested so older config.toml
+    /// files without a `[logs]` table keep loading.
+    #[serde(default)]
+    pub logs: LogsConfig,
+}
+
+/// Opt-in EVE log tailing: solar-system names on previews plus short
+/// alerts on inactive clients (fleet invite, follow/warp, etc.).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LogsConfig {
+    /// Master switch. Off by default so a missing Wine/Proton log path
+    /// doesn't surprise Linux users on upgrade.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Override for the Chatlogs directory. Empty = auto-detect.
+    #[serde(default)]
+    pub chatlog_dir: String,
+    /// Override for the Gamelogs directory. Empty = auto-detect.
+    #[serde(default)]
+    pub gamelog_dir: String,
+    /// Show `Character  ·  Jita` on preview title strips / list rows.
+    #[serde(default = "default_true")]
+    pub show_system: bool,
+    /// Thin incoming/outgoing DPS row under the preview title. Off the
+    /// alert banner on purpose — combat ticks are too frequent to flash.
+    #[serde(default = "default_true")]
+    pub show_dps: bool,
+    /// Drop / clear alerts for the currently-focused EVE client.
+    #[serde(default = "default_true")]
+    pub alerts_on_inactive_only: bool,
+    /// How long an alert banner stays up, in seconds.
+    #[serde(default = "default_alert_secs")]
+    pub alert_secs: u32,
+    /// Play the embedded alert beep when an enabled alert fires.
+    #[serde(default)]
+    pub alert_sound: bool,
+    #[serde(default)]
+    pub alerts: AlertToggles,
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chatlog_dir: String::new(),
+            gamelog_dir: String::new(),
+            show_system: true,
+            show_dps: true,
+            alerts_on_inactive_only: true,
+            alert_secs: default_alert_secs(),
+            alert_sound: false,
+            alerts: AlertToggles::default(),
+        }
+    }
+}
+
+/// Per-kind enable flags. README four default on; the extras EVE-APM
+/// also parses default off.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AlertToggles {
+    #[serde(default = "default_true")]
+    pub fleet_invite: bool,
+    #[serde(default = "default_true")]
+    pub follow_warp: bool,
+    #[serde(default = "default_true")]
+    pub regroup: bool,
+    #[serde(default = "default_true")]
+    pub compression: bool,
+    #[serde(default)]
+    pub decloak: bool,
+    #[serde(default)]
+    pub convo_request: bool,
+    #[serde(default)]
+    pub crystal_broke: bool,
+}
+
+impl Default for AlertToggles {
+    fn default() -> Self {
+        Self {
+            fleet_invite: true,
+            follow_warp: true,
+            regroup: true,
+            compression: true,
+            decloak: false,
+            convo_request: false,
+            crystal_broke: false,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -287,6 +375,14 @@ fn default_window_height() -> u32 {
     680
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_alert_secs() -> u32 {
+    8
+}
+
 impl Config {
     /// Resolve the directory holding `config.toml`. Production callers
     /// get the platform-standard config dir (XDG on Linux, Roaming
@@ -397,6 +493,7 @@ impl Config {
             character_hotkeys: HashMap::new(),
             window_width: default_window_width(),
             window_height: default_window_height(),
+            logs: LogsConfig::default(),
         }
     }
 
@@ -481,6 +578,7 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            logs: LogsConfig::default(),
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -520,6 +618,7 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            logs: LogsConfig::default(),
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -558,6 +657,7 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            logs: LogsConfig::default(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -595,5 +695,79 @@ mod tests {
             deserialized.window_height, 800,
             "window_height must survive a save/load round-trip"
         );
+    }
+
+    #[test]
+    fn logs_section_defaults_when_absent() {
+        // Older config.toml files have no `[logs]` table.
+        let parsed: Config = toml::from_str(
+            r#"
+display_width = 1920
+display_height = 1080
+panel_height = 0
+eve_width = 1000
+eve_height = 1080
+"#,
+        )
+        .unwrap();
+        assert!(!parsed.logs.enabled);
+        assert!(parsed.logs.show_system);
+        assert!(parsed.logs.show_dps);
+        assert!(parsed.logs.alerts.fleet_invite);
+        assert!(!parsed.logs.alerts.decloak);
+        assert_eq!(parsed.logs.alert_secs, 8);
+    }
+
+    #[test]
+    fn logs_section_round_trip() {
+        let logs = LogsConfig {
+            enabled: true,
+            chatlog_dir: "/tmp/chat".into(),
+            alerts: AlertToggles {
+                decloak: true,
+                ..AlertToggles::default()
+            },
+            alert_sound: true,
+            ..LogsConfig::default()
+        };
+        let config = Config {
+            display_width: 1920,
+            display_height: 1080,
+            panel_height: 0,
+            window_width: 720,
+            window_height: 680,
+            eve_width: 1000,
+            eve_height: 1080,
+            enable_mouse_buttons: true,
+            forward_button: 276,
+            backward_button: 275,
+            enable_keyboard_buttons: false,
+            forward_key: 15,
+            backward_key: 15,
+            mouse_device_name: None,
+            mouse_device_path: None,
+            minimize_inactive: false,
+            keyboard_device_path: None,
+            modifier_key: None,
+            preview_width: 320,
+            preview_height: 180,
+            preview_opacity: 100,
+            show_previews: true,
+            hide_active_preview: false,
+            constrain_aspect: false,
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
+            characters: Vec::new(),
+            display_mode: DisplayMode::Previews,
+            positions_locked: false,
+            character_hotkeys: HashMap::new(),
+            logs,
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let deserialized: Config = toml::from_str(&toml_str).unwrap();
+        assert!(deserialized.logs.enabled);
+        assert_eq!(deserialized.logs.chatlog_dir, "/tmp/chat");
+        assert!(deserialized.logs.alerts.decloak);
+        assert!(deserialized.logs.alert_sound);
     }
 }

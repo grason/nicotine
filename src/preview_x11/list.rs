@@ -7,6 +7,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{
@@ -36,8 +37,11 @@ pub(super) struct RowResources {
     pub(super) red_picture: u32,
     pub(super) black_pixmap: u32,
     pub(super) black_picture: u32,
+    pub(super) gold_pixmap: u32,
+    pub(super) gold_picture: u32,
     pub(super) text_w: u16,
     pub(super) text_h: u16,
+    pub(super) has_alert: bool,
 }
 
 /// Owns the list-view window's resources. Drop releases the row
@@ -58,6 +62,9 @@ pub(super) struct OwnedListWindow {
     /// current cycle order in `update_list_rows` to decide whether to
     /// re-rasterize the rows + resize the window.
     pub(super) last_names: Vec<String>,
+    /// `(name, label, has_alert)` as last rasterized, so a solar-system
+    /// or alert change rebuilds even when the character set didn't.
+    pub(super) last_row_sig: Vec<(String, String, bool)>,
     pub(super) width: u16,
     pub(super) height: u16,
     pub(super) x: i16,
@@ -74,8 +81,10 @@ impl Drop for OwnedListWindow {
         for row in self.rows.drain().map(|(_, v)| v) {
             let _ = self.conn.render_free_picture(row.red_picture);
             let _ = self.conn.render_free_picture(row.black_picture);
+            let _ = self.conn.render_free_picture(row.gold_picture);
             let _ = self.conn.free_pixmap(row.red_pixmap);
             let _ = self.conn.free_pixmap(row.black_pixmap);
+            let _ = self.conn.free_pixmap(row.gold_pixmap);
         }
         let _ = self.conn.render_free_picture(self.dst_picture);
         let _ = self.conn.render_free_picture(self.title_picture);
@@ -206,6 +215,7 @@ impl PreviewManager {
             title_text_h,
             rows: HashMap::new(),
             last_names: Vec::new(),
+            last_row_sig: Vec::new(),
             width: LIST_WIDTH,
             height,
             x: init_x as i16,
@@ -229,8 +239,29 @@ impl PreviewManager {
             .map(|w| w.title)
             .collect();
 
+        let (enabled, show_system) = {
+            let logs = self.logs_config.lock_recover();
+            (logs.enabled, logs.show_system)
+        };
+        let now = Instant::now();
+        let live = self.log_live.lock_recover();
+        let row_sig: Vec<(String, String, bool)> = names
+            .iter()
+            .map(|name| {
+                let system = if enabled && show_system {
+                    live.system_for(name)
+                } else {
+                    None
+                };
+                let label = crate::preview_common::title_label(name, system);
+                let has_alert = enabled && live.alert_for(name, now).is_some();
+                (name.clone(), label, has_alert)
+            })
+            .collect();
+        drop(live);
+
         let needs_rebuild = match &self.list_window {
-            Some(list) => list.last_names != names,
+            Some(list) => list.last_row_sig != row_sig,
             None => return Ok(()),
         };
         if !needs_rebuild {
@@ -251,19 +282,21 @@ impl PreviewManager {
         for row in old_rows {
             let _ = self.conn.render_free_picture(row.red_picture);
             let _ = self.conn.render_free_picture(row.black_picture);
+            let _ = self.conn.render_free_picture(row.gold_picture);
             let _ = self.conn.free_pixmap(row.red_pixmap);
             let _ = self.conn.free_pixmap(row.black_pixmap);
+            let _ = self.conn.free_pixmap(row.gold_pixmap);
         }
 
         let parent = self.list_window.as_ref().unwrap().window;
         let mut new_rows = HashMap::new();
-        for name in &names {
+        for (name, label, has_alert) in &row_sig {
             // Active marker: black-right-pointing-small-triangle. The
             // Windows manager uses 🚬 (cigarette emoji) which JetBrains
             // Mono doesn't ship a glyph for; ▸ keeps a single bundled
             // font working.
-            let active_text = format!("▸ {}", name);
-            let inactive_text = format!("  {}", name);
+            let active_text = format!("▸ {label}");
+            let inactive_text = format!("  {label}");
             let (red_pixmap, red_picture, text_w, text_h) = create_text_pixmap(
                 &self.conn,
                 parent,
@@ -282,6 +315,15 @@ impl PreviewManager {
                 LIST_ROW_FONT_PX,
                 self.argb32_format,
             )?;
+            let (gold_pixmap, gold_picture, _, _) = create_text_pixmap(
+                &self.conn,
+                parent,
+                &inactive_text,
+                NICOTINE_GOLD,
+                jetbrains_mono(),
+                LIST_ROW_FONT_PX,
+                self.argb32_format,
+            )?;
             new_rows.insert(
                 name.clone(),
                 RowResources {
@@ -289,8 +331,11 @@ impl PreviewManager {
                     red_picture,
                     black_pixmap,
                     black_picture,
+                    gold_pixmap,
+                    gold_picture,
                     text_w,
                     text_h,
+                    has_alert: *has_alert,
                 },
             );
         }
@@ -299,6 +344,7 @@ impl PreviewManager {
         let resize = if let Some(list) = self.list_window.as_mut() {
             list.rows = new_rows;
             list.last_names = names;
+            list.last_row_sig = row_sig;
             let needs = list.height != new_height;
             if needs {
                 list.height = new_height;
@@ -397,8 +443,14 @@ impl PreviewManager {
                     .active_character
                     .as_ref()
                     .is_some_and(|active| active == name);
-                let pic = if is_active {
+                let taking = self
+                    .log_live
+                    .lock_recover()
+                    .taking_damage(name, Instant::now());
+                let pic = if is_active || taking {
                     row.red_picture
+                } else if row.has_alert {
+                    row.gold_picture
                 } else {
                     row.black_picture
                 };

@@ -55,6 +55,14 @@ fn thumbnail_size_normal_dimensions() {
 }
 
 #[test]
+fn thumbnail_size_with_banner_shrinks_height() {
+    let (w, h) = thumbnail_size_with_banner(480, 270, true);
+    let (w0, h0) = thumbnail_size(480, 270);
+    assert_eq!(w, w0);
+    assert_eq!(h, h0 - ALERT_BANNER_HEIGHT);
+}
+
+#[test]
 fn thumbnail_size_floors_at_one_not_zero() {
     // Zero-dim drawables make XRender unhappy. The `.max(1)` clamp
     // on each axis is the safety floor; this catches anyone

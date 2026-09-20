@@ -1,7 +1,9 @@
-use crate::config::{Config, LiveSettings};
+use crate::config::{Config, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
+use crate::eve_logs::LogLiveState;
 use crate::preview_common::{
-    preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    dps_in_label, dps_out_label, preview_should_hide, snap_position, thumbnail_dest, title_label,
+    DragRect, DragState, ALERT_BANNER_PX, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -10,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -22,7 +25,8 @@ use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush,
     DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode,
     SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HFONT, LOGFONTW, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HFONT, LOGFONTW,
+    OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -156,6 +160,8 @@ const NICOTINE_RED: COLORREF = COLORREF(0x003A_1EC4);
 const CHROME_DARK: COLORREF = COLORREF(0x0000_0000);
 /// Cream background for the list window body (RGB 252, 250, 242).
 const NICOTINE_CREAM: COLORREF = COLORREF(0x00F2_FAFC);
+/// Brand gold (RGB 180, 155, 105) — inactive-client alert border / row.
+const NICOTINE_GOLD: COLORREF = COLORREF(0x0069_9BB4);
 /// Text color for inactive rows in the list window.
 const LIST_TEXT_BLACK: COLORREF = COLORREF(0x0000_0000);
 
@@ -179,6 +185,14 @@ struct PreviewWindowState {
     /// window. Read from WM_PAINT to choose border color. Updated by
     /// reconcile via the GWLP_USERDATA pointer.
     is_active: bool,
+    /// Last title-strip label (`Name` or `Name  ·  Jita`).
+    title_label: String,
+    /// Live alert banner text. Presence also shrinks the DWM dest rect.
+    alert_text: Option<String>,
+    showing_dps: bool,
+    dps_in_label: String,
+    dps_out_label: String,
+    taking_damage: bool,
 }
 
 /// One owned preview window. Drop unregisters the DWM thumbnail.
@@ -223,6 +237,8 @@ struct PreviewManager {
     /// config panel). Checked on every reconcile tick; any difference from
     /// the cached config values triggers a resize pass over all previews.
     live: Arc<Mutex<LiveSettings>>,
+    logs_config: Arc<Mutex<LogsConfig>>,
+    log_live: Arc<Mutex<LogLiveState>>,
     /// Mirror of `live.display_mode` from the last reconcile. Used to
     /// detect transitions so we can tear down the outgoing mode's windows
     /// before spawning the incoming mode's.
@@ -239,6 +255,9 @@ struct PreviewManager {
     /// InvalidateRect every 100ms otherwise produces a visible flicker
     /// and feels sluggish.
     list_last_names: Vec<String>,
+    /// `(name, label, has_alert)` last painted, so a system/alert change
+    /// invalidates even when the character set didn't.
+    list_last_rows: Vec<(String, String, bool, bool)>,
 }
 
 /// Drop-guard for the list window — destroys the Win32 window and the
@@ -312,6 +331,7 @@ impl PreviewManager {
         // (rare). The hook is the primary path and updates instantly.
         let active_id = self.wm.get_active_window().unwrap_or(0);
         self.update_active(active_id);
+        self.apply_log_chrome();
     }
 
     fn reconcile_previews(&mut self) {
@@ -523,7 +543,8 @@ impl PreviewManager {
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
-                    update_thumbnail_rect((*ptr).thumbnail, w, h);
+                    let banner = (*ptr).alert_text.is_some();
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, banner);
                 }
                 // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
@@ -572,6 +593,133 @@ impl PreviewManager {
                 let _ = ShowWindow(preview.hwnd, cmd);
             }
         }
+    }
+
+    /// Push solar-system titles and alert banners from the log tailer
+    /// onto preview chrome / list rows. Drops the focused client's alert
+    /// when `alerts_on_inactive_only` is on.
+    fn apply_log_chrome(&mut self) {
+        let (enabled, show_system, show_dps, inactive_only) = {
+            let logs = self.logs_config.lock().unwrap();
+            (
+                logs.enabled,
+                logs.show_system,
+                logs.show_dps,
+                logs.alerts_on_inactive_only,
+            )
+        };
+        let now = Instant::now();
+        if enabled && inactive_only {
+            let active_name = self.previews.iter().find_map(|(name, p)| {
+                if p.source_id == self.active_id {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(name) = active_name {
+                self.log_live.lock().unwrap().drop_alert(&name);
+            }
+        }
+
+        for (name, preview) in &self.previews {
+            let (system, alert, dps, taking) = if enabled {
+                let live = self.log_live.lock().unwrap();
+                let system = if show_system {
+                    live.system_for(name).map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let alert = live.alert_for(name, now).map(|a| a.text.clone());
+                let dps = if show_dps { live.dps_for(name) } else { None };
+                let taking = live.taking_damage(name, now);
+                (system, alert, dps, taking)
+            } else {
+                (None, None, None, false)
+            };
+            let label = title_label(name, system.as_deref());
+            let (want_dps, in_l, out_l) = match dps {
+                Some(r) if !r.is_idle() => {
+                    (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
+                }
+                _ => (false, String::new(), String::new()),
+            };
+            unsafe {
+                let ptr = GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *mut PreviewWindowState;
+                if ptr.is_null() {
+                    continue;
+                }
+                let banner_was = (*ptr).alert_text.is_some();
+                let changed = (*ptr).title_label != label
+                    || (*ptr).alert_text != alert
+                    || (*ptr).showing_dps != want_dps
+                    || (*ptr).dps_in_label != in_l
+                    || (*ptr).dps_out_label != out_l
+                    || (*ptr).taking_damage != taking;
+                (*ptr).title_label = label;
+                (*ptr).alert_text = alert;
+                (*ptr).showing_dps = want_dps;
+                (*ptr).dps_in_label = in_l;
+                (*ptr).dps_out_label = out_l;
+                (*ptr).taking_damage = taking;
+                let banner_now = (*ptr).alert_text.is_some();
+                if banner_was != banner_now {
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(preview.hwnd, &mut rect);
+                    update_thumbnail_rect(
+                        (*ptr).thumbnail,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        banner_now,
+                    );
+                }
+                if changed {
+                    let _ = InvalidateRect(Some(preview.hwnd), None, true);
+                }
+            }
+        }
+
+        if self.list.is_some() {
+            let rows = self.list_row_sig(enabled, show_system, now);
+            if rows != self.list_last_rows {
+                self.list_last_rows = rows;
+                if let Some(list) = &self.list {
+                    unsafe {
+                        let _ = InvalidateRect(Some(list.hwnd), None, false);
+                    }
+                }
+            }
+        }
+    }
+
+    fn list_row_sig(
+        &self,
+        enabled: bool,
+        show_system: bool,
+        now: Instant,
+    ) -> Vec<(String, String, bool, bool)> {
+        let names: Vec<String> = {
+            let s = self.state.lock().unwrap();
+            s.get_ordered_windows()
+                .into_iter()
+                .map(|w| w.title)
+                .collect()
+        };
+        let live = self.log_live.lock().unwrap();
+        names
+            .into_iter()
+            .map(|name| {
+                let system = if enabled && show_system {
+                    live.system_for(&name)
+                } else {
+                    None
+                };
+                let label = title_label(&name, system);
+                let has_alert = enabled && live.alert_for(&name, now).is_some();
+                let taking = enabled && live.taking_damage(&name, now);
+                (name, label, has_alert, taking)
+            })
+            .collect()
     }
 
     /// Snapshot of all preview window rects in screen coordinates,
@@ -698,7 +846,7 @@ impl PreviewManager {
             DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
                 .context("DwmRegisterThumbnail failed")?
         };
-        update_thumbnail_rect(thumbnail, width, height);
+        update_thumbnail_rect(thumbnail, width, height, false);
 
         let per_window = Box::new(PreviewWindowState {
             source_id: window.id,
@@ -708,6 +856,12 @@ impl PreviewManager {
             positions: Arc::clone(&self.positions),
             drag: DragState::default(),
             is_active: false,
+            title_label: window.title.clone(),
+            alert_text: None,
+            showing_dps: false,
+            dps_in_label: String::new(),
+            dps_out_label: String::new(),
+            taking_damage: false,
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
@@ -755,21 +909,24 @@ impl PreviewManager {
 /// mirror the whole source window (including any title bar/border) — EVE's
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
-fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, banner: bool) {
     let border = px(BORDER_WIDTH);
     let title = px(TITLE_HEIGHT);
+    let banner_h = if banner { px(ALERT_BANNER_PX) } else { 0 };
+    let (left, top, right, bottom) = thumbnail_dest(width, height, title, border, banner_h);
     // The thumbnail is always pushed fully opaque (255). User-facing
     // translucency is applied to the host window via apply_window_opacity;
     // scaling the thumbnail opacity instead would blend the mirror against
     // the opaque chrome background (CHROME_DARK), darkening toward black
-    // rather than revealing the desktop behind.
+    // rather than revealing the desktop behind. The dest rect stops above
+    // the GDI alert banner so DWM cannot paint over it.
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
         rcDestination: RECT {
-            left: border,
-            top: title,
-            right: width - border,
-            bottom: height - border,
+            left,
+            top,
+            right,
+            bottom,
         },
         rcSource: RECT::default(),
         opacity: 255,
@@ -817,7 +974,7 @@ unsafe extern "system" fn preview_wnd_proc(
 
     match msg {
         WM_PAINT => {
-            paint_chrome(hwnd, &state.character_name, state.is_active);
+            paint_chrome(hwnd, state);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -986,11 +1143,12 @@ fn nicotine_logo_font() -> HFONT {
 }
 
 /// Paint the preview's chrome: a title strip at the top with the
-/// character name, plus a left/right/bottom border around the thumbnail
-/// area. Border color is Nicotine red when this client is the system
-/// foreground window, otherwise the same dark color as the title strip
-/// (so it blends seamlessly).
-unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
+/// character name (and solar system when known), plus a left/right/bottom
+/// border around the thumbnail area. Border is Nicotine red when this
+/// client is the system foreground window, gold when an inactive client
+/// has a live alert, otherwise dark. A cream alert banner sits above
+/// the bottom border — outside the DWM dest rect.
+unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
 
@@ -999,12 +1157,25 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
 
-    let chrome_color = if is_active { NICOTINE_RED } else { CHROME_DARK };
+    let has_alert = state.alert_text.is_some() && !state.is_active;
+    let chrome_color = if state.is_active || state.taking_damage {
+        NICOTINE_RED
+    } else if has_alert {
+        NICOTINE_GOLD
+    } else {
+        CHROME_DARK
+    };
     let chrome_brush = CreateSolidBrush(chrome_color);
     let title_h = px(TITLE_HEIGHT);
     let border_w = px(BORDER_WIDTH);
+    let banner_h = if state.alert_text.is_some() {
+        px(ALERT_BANNER_PX)
+    } else {
+        0
+    };
 
-    // Top strip (full-width title bar).
+    // Top strip (full-width title bar). DPS, when live, sits in this
+    // same 24px row so the thumbnail dest never moves.
     let title_strip = RECT {
         left: 0,
         top: 0,
@@ -1038,19 +1209,86 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
 
     let _ = DeleteObject(chrome_brush.into());
 
-    // White centered character name in the title strip.
+    // White centered character name (plus system) in the title strip.
+    // When DPS is live, inset the name so ↓ / ↑ on the sides don't overlap.
     let _ = SetBkMode(hdc, TRANSPARENT);
     let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
     let body_font = nicotine_body_font();
     let prev_font = SelectObject(hdc, body_font.into());
-    let mut text: Vec<u16> = character_name.encode_utf16().collect();
-    let mut text_rect = title_strip;
+    let mut text: Vec<u16> = state.title_label.encode_utf16().collect();
+    let dps_side = if state.showing_dps { px(56) } else { 0 };
+    let mut text_rect = RECT {
+        left: title_strip.left + dps_side,
+        top: title_strip.top,
+        right: title_strip.right - dps_side,
+        bottom: title_strip.bottom,
+    };
     let _ = DrawTextW(
         hdc,
         &mut text,
         &mut text_rect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
+
+    if state.showing_dps {
+        let _ = SetTextColor(hdc, NICOTINE_RED);
+        let mut in_buf: Vec<u16> = state.dps_in_label.encode_utf16().collect();
+        let mut in_rect = RECT {
+            left: title_strip.left + px(6),
+            top: title_strip.top,
+            right: title_strip.left + dps_side,
+            bottom: title_strip.bottom,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut in_buf,
+            &mut in_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+        let _ = SetTextColor(hdc, NICOTINE_GOLD);
+        let mut out_buf: Vec<u16> = state.dps_out_label.encode_utf16().collect();
+        let mut out_rect = RECT {
+            left: title_strip.right - dps_side,
+            top: title_strip.top,
+            right: title_strip.right - px(6),
+            bottom: title_strip.bottom,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut out_buf,
+            &mut out_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS,
+        );
+        let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+    }
+
+    if let Some(alert) = &state.alert_text {
+        let banner_top = height - border_w - banner_h;
+        let cream_brush = CreateSolidBrush(NICOTINE_CREAM);
+        let banner_rect = RECT {
+            left: border_w,
+            top: banner_top,
+            right: width - border_w,
+            bottom: height - border_w,
+        };
+        FillRect(hdc, &banner_rect, cream_brush);
+        let _ = DeleteObject(cream_brush.into());
+        let _ = SetTextColor(hdc, NICOTINE_RED);
+        let mut alert_buf: Vec<u16> = alert.encode_utf16().collect();
+        let mut alert_rect = RECT {
+            left: banner_rect.left + px(6),
+            top: banner_rect.top,
+            right: banner_rect.right - px(4),
+            bottom: banner_rect.bottom,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut alert_buf,
+            &mut alert_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
     SelectObject(hdc, prev_font);
 
     let _ = EndPaint(hwnd, &ps);
@@ -1227,13 +1465,35 @@ unsafe fn paint_list(hwnd: HWND) {
     let mut y = title_h + px(2);
     for window in &windows {
         let is_active = window.id == active_id;
-        let text = if is_active {
-            format!("🚬 {}", window.title)
-        } else {
-            format!("     {}", window.title)
+        let (label, has_alert) = {
+            let (enabled, show_system) = {
+                let logs = mgr.logs_config.lock().unwrap();
+                (logs.enabled, logs.show_system)
+            };
+            let live = mgr.log_live.lock().unwrap();
+            let system = if enabled && show_system {
+                live.system_for(&window.title)
+            } else {
+                None
+            };
+            let label = title_label(&window.title, system);
+            let has_alert = enabled && live.alert_for(&window.title, Instant::now()).is_some();
+            (label, has_alert)
         };
-        let color = if is_active {
+        let text = if is_active {
+            format!("🚬 {label}")
+        } else {
+            format!("     {label}")
+        };
+        let taking = mgr
+            .log_live
+            .lock()
+            .unwrap()
+            .taking_damage(&window.title, Instant::now());
+        let color = if is_active || taking {
             NICOTINE_RED
+        } else if has_alert {
+            NICOTINE_GOLD
         } else {
             LIST_TEXT_BLACK
         };
@@ -1350,9 +1610,11 @@ pub fn spawn(
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
     live: Arc<Mutex<LiveSettings>>,
+    logs_config: Arc<Mutex<LogsConfig>>,
+    log_live: Arc<Mutex<LogLiveState>>,
 ) -> Result<JoinHandle<()>> {
     let handle = std::thread::spawn(move || {
-        if let Err(e) = run_manager(config, wm, state, live) {
+        if let Err(e) = run_manager(config, wm, state, live, logs_config, log_live) {
             eprintln!("Preview window manager exited with error: {}", e);
         }
     });
@@ -1364,6 +1626,8 @@ fn run_manager(
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
     live: Arc<Mutex<LiveSettings>>,
+    logs_config: Arc<Mutex<LogsConfig>>,
+    log_live: Arc<Mutex<LogLiveState>>,
 ) -> Result<()> {
     // Touch the thread ID so message routing works (and so any future
     // PostThreadMessage senders have a stable ID to target).
@@ -1408,10 +1672,13 @@ fn run_manager(
         previews: HashMap::new(),
         next_default_offset: 0,
         live,
+        logs_config,
+        log_live,
         current_mode: initial_mode,
         list: None,
         active_id: 0,
         list_last_names: Vec::new(),
+        list_last_rows: Vec::new(),
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);

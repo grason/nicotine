@@ -21,14 +21,16 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
+use crate::preview_common::thumbnail_dest;
+
 use super::render::{
     apply_scale_transform, create_text_pixmap, jetbrains_mono, pick_visual_format, thumbnail_size,
-    xcolor,
+    thumbnail_size_with_banner, xcolor,
 };
 use super::{
-    opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, BORDER_WIDTH, CHROME_DARK,
-    NICOTINE_CREAM, NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT,
-    TITLE_TEXT_LEFT_PAD,
+    opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, ALERT_BANNER_HEIGHT,
+    BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_RED, PREVIEW_HEIGHT,
+    PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
 };
 
 /// Owns one preview window's resources. Drop releases everything in
@@ -66,6 +68,32 @@ pub(super) struct OwnedPreview {
     pub(super) title_picture: u32,
     pub(super) title_text_w: u16,
     pub(super) title_text_h: u16,
+    /// Last title-strip label we rasterized (`Name` or `Name  ·  Jita`).
+    /// Rebuilt when the solar system changes.
+    pub(super) title_label: String,
+    /// Live alert banner text, if any. Presence also shrinks the
+    /// thumbnail dest so the cream strip isn't covered by the composite.
+    pub(super) alert_text: Option<String>,
+    pub(super) alert_pixmap: Option<u32>,
+    pub(super) alert_picture: Option<u32>,
+    pub(super) alert_text_w: u16,
+    pub(super) alert_text_h: u16,
+    /// Quiet DPS meter under the name strip. Hidden when both rates
+    /// are idle. Labels are the last formatted strings we rasterized.
+    pub(super) showing_dps: bool,
+    pub(super) dps_in_label: String,
+    pub(super) dps_out_label: String,
+    pub(super) dps_in_pixmap: Option<u32>,
+    pub(super) dps_in_picture: Option<u32>,
+    pub(super) dps_in_w: u16,
+    pub(super) dps_in_h: u16,
+    pub(super) dps_out_pixmap: Option<u32>,
+    pub(super) dps_out_picture: Option<u32>,
+    pub(super) dps_out_w: u16,
+    pub(super) dps_out_h: u16,
+    /// Incoming-hit flash. Lights the chrome red on inactive clients
+    /// for `INCOMING_FLASH` after the last incoming combat line.
+    pub(super) taking_damage: bool,
     /// Current window dimensions. Updated on live-size apply (panel
     /// slider drags) and reflected in the next chrome paint + thumbnail
     /// transform.
@@ -126,6 +154,24 @@ impl Drop for OwnedPreview {
         let _ = self.conn.render_free_picture(self.window_picture);
         let _ = self.conn.render_free_picture(self.title_picture);
         let _ = self.conn.free_pixmap(self.title_pixmap);
+        if let Some(pic) = self.alert_picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = self.alert_pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
+        if let Some(pic) = self.dps_in_picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = self.dps_in_pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
+        if let Some(pic) = self.dps_out_picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = self.dps_out_pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
         let _ = self.conn.free_pixmap(self.src_pixmap);
         let _ = self
             .conn
@@ -354,6 +400,24 @@ impl PreviewManager {
             title_picture,
             title_text_w,
             title_text_h,
+            title_label: title.to_string(),
+            alert_text: None,
+            alert_pixmap: None,
+            alert_picture: None,
+            alert_text_w: 0,
+            alert_text_h: 0,
+            showing_dps: false,
+            dps_in_label: String::new(),
+            dps_out_label: String::new(),
+            dps_in_pixmap: None,
+            dps_in_picture: None,
+            dps_in_w: 0,
+            dps_in_h: 0,
+            dps_out_pixmap: None,
+            dps_out_picture: None,
+            dps_out_w: 0,
+            dps_out_h: 0,
+            taking_damage: false,
             width: init_w,
             height: init_h,
             source_w: geom.width,
@@ -380,39 +444,44 @@ impl PreviewManager {
 
     /// Paint chrome on a preview: fill the title strip + borders with
     /// the chrome color (Nicotine red when source is the foreground
-    /// window, dark otherwise), then composite the pre-rasterized
-    /// character-name text on top of the strip.
+    /// window, gold when an inactive client has a live alert, dark
+    /// otherwise), then composite the pre-rasterized title text. A
+    /// cream alert banner sits above the bottom border when `alert_text`
+    /// is set.
     pub(super) fn paint_chrome(&self, preview: &OwnedPreview) -> Result<()> {
         let conn = &self.conn;
+        let has_alert = preview.alert_text.is_some() && !preview.is_active;
         let chrome_color = xcolor(
-            if preview.is_active {
+            if preview.is_active || preview.taking_damage {
                 NICOTINE_RED
+            } else if has_alert {
+                NICOTINE_GOLD
             } else {
                 CHROME_DARK
             },
             0xffff,
         );
 
-        // Title strip (full width, top of window) + 3 borders around
-        // the thumbnail area. One round-trip.
+        let title_h = TITLE_STRIP_HEIGHT;
+        // Title strip + 3 borders around the thumbnail area. One round-trip.
         let rects = [
             XRectangle {
                 x: 0,
                 y: 0,
                 width: preview.width,
-                height: TITLE_STRIP_HEIGHT,
+                height: title_h,
             },
             XRectangle {
                 x: 0,
-                y: TITLE_STRIP_HEIGHT as i16,
+                y: title_h as i16,
                 width: BORDER_WIDTH,
-                height: preview.height - TITLE_STRIP_HEIGHT,
+                height: preview.height - title_h,
             },
             XRectangle {
                 x: (preview.width - BORDER_WIDTH) as i16,
-                y: TITLE_STRIP_HEIGHT as i16,
+                y: title_h as i16,
                 width: BORDER_WIDTH,
-                height: preview.height - TITLE_STRIP_HEIGHT,
+                height: preview.height - title_h,
             },
             XRectangle {
                 x: 0,
@@ -426,8 +495,38 @@ impl PreviewManager {
         // Composite the pre-rasterized text on top. Source is ARGB32
         // (cream RGB premultiplied with the rasterized alpha); PictOp
         // OVER blends it onto the chrome strip we just filled.
+        // With DPS on, ↓ sits left, ↑ sits right, and the name is
+        // clipped into the remaining middle so the dest rect never moves.
         let baseline_y = (TITLE_STRIP_HEIGHT as i16 - preview.title_text_h as i16) / 2;
         let baseline_y = baseline_y.max(0);
+        let gap: i16 = 8;
+        let in_w = if preview.showing_dps {
+            preview.dps_in_w
+        } else {
+            0
+        };
+        let out_w = if preview.showing_dps {
+            preview.dps_out_w
+        } else {
+            0
+        };
+        let name_x = TITLE_TEXT_LEFT_PAD
+            + if preview.showing_dps {
+                in_w as i16 + gap
+            } else {
+                0
+            };
+        let name_max_w = {
+            let right = preview.width as i16
+                - BORDER_WIDTH as i16
+                - TITLE_TEXT_LEFT_PAD
+                - if preview.showing_dps {
+                    out_w as i16 + gap
+                } else {
+                    0
+                };
+            (right - name_x).max(0) as u16
+        };
         conn.render_composite(
             PictOp::OVER,
             preview.title_picture,
@@ -437,11 +536,86 @@ impl PreviewManager {
             0,
             0,
             0,
-            TITLE_TEXT_LEFT_PAD,
+            name_x,
             baseline_y,
-            preview.title_text_w,
-            preview.title_text_h,
+            preview.title_text_w.min(name_max_w),
+            preview.title_text_h.min(TITLE_STRIP_HEIGHT),
         )?;
+
+        if preview.showing_dps {
+            if let Some(pic) = preview.dps_in_picture {
+                let ty = (TITLE_STRIP_HEIGHT as i16 - preview.dps_in_h as i16) / 2;
+                conn.render_composite(
+                    PictOp::OVER,
+                    pic,
+                    x11rb::NONE,
+                    preview.render_picture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    TITLE_TEXT_LEFT_PAD,
+                    ty.max(0),
+                    preview.dps_in_w,
+                    preview.dps_in_h.min(TITLE_STRIP_HEIGHT),
+                )?;
+            }
+            if let Some(pic) = preview.dps_out_picture {
+                let tx = (preview.width as i16)
+                    - BORDER_WIDTH as i16
+                    - TITLE_TEXT_LEFT_PAD
+                    - preview.dps_out_w as i16;
+                let ty = (TITLE_STRIP_HEIGHT as i16 - preview.dps_out_h as i16) / 2;
+                conn.render_composite(
+                    PictOp::OVER,
+                    pic,
+                    x11rb::NONE,
+                    preview.render_picture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    tx.max(TITLE_TEXT_LEFT_PAD),
+                    ty.max(0),
+                    preview.dps_out_w,
+                    preview.dps_out_h.min(TITLE_STRIP_HEIGHT),
+                )?;
+            }
+        }
+
+        if let (Some(_text), Some(alert_picture)) =
+            (preview.alert_text.as_ref(), preview.alert_picture)
+        {
+            let banner_h = ALERT_BANNER_HEIGHT;
+            let banner_y = (preview.height - BORDER_WIDTH - banner_h) as i16;
+            let cream = xcolor(NICOTINE_CREAM, 0xffff);
+            let banner = XRectangle {
+                x: BORDER_WIDTH as i16,
+                y: banner_y,
+                width: preview.width.saturating_sub(BORDER_WIDTH * 2),
+                height: banner_h,
+            };
+            conn.render_fill_rectangles(PictOp::SRC, preview.render_picture, cream, &[banner])?;
+            let text_y = banner_y + (banner_h as i16 - preview.alert_text_h as i16) / 2;
+            let max_w = preview
+                .width
+                .saturating_sub(BORDER_WIDTH * 2)
+                .saturating_sub(TITLE_TEXT_LEFT_PAD as u16);
+            conn.render_composite(
+                PictOp::OVER,
+                alert_picture,
+                x11rb::NONE,
+                preview.render_picture,
+                0,
+                0,
+                0,
+                0,
+                TITLE_TEXT_LEFT_PAD,
+                text_y.max(banner_y),
+                preview.alert_text_w.min(max_w),
+                preview.alert_text_h.min(banner_h),
+            )?;
+        }
 
         Ok(())
     }
@@ -465,8 +639,10 @@ impl PreviewManager {
             preview.source_id,
             preview.source_w,
             preview.source_h,
-            thumbnail_size(preview.width, preview.height).0,
-            thumbnail_size(preview.width, preview.height).1,
+            thumbnail_size_with_banner(preview.width, preview.height, preview.alert_text.is_some())
+                .0,
+            thumbnail_size_with_banner(preview.width, preview.height, preview.alert_text.is_some())
+                .1,
             preview.src_picture,
             preview.src_pixmap,
         );
@@ -546,7 +722,18 @@ impl PreviewManager {
             Some(p) => p,
             None => return Ok(()),
         };
-        let (thumb_w, thumb_h) = thumbnail_size(preview.width, preview.height);
+        let banner = if preview.alert_text.is_some() {
+            ALERT_BANNER_HEIGHT as i32
+        } else {
+            0
+        };
+        let (left, top, right, bottom) = thumbnail_dest(
+            preview.width as i32,
+            preview.height as i32,
+            TITLE_STRIP_HEIGHT as i32,
+            BORDER_WIDTH as i32,
+            banner,
+        );
         self.conn.render_composite(
             PictOp::SRC,
             preview.src_picture,
@@ -556,10 +743,10 @@ impl PreviewManager {
             0,
             0,
             0,
-            BORDER_WIDTH as i16,
-            TITLE_STRIP_HEIGHT as i16,
-            thumb_w,
-            thumb_h,
+            left as i16,
+            top as i16,
+            (right - left) as u16,
+            (bottom - top) as u16,
         )?;
         // Blit the finished offscreen frame straight onto the window with one
         // composite — no X Present extension (see `window_picture`).

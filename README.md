@@ -178,12 +178,23 @@ sudo evtest /dev/input/eventX # Replace X with the correct event number i.e even
 
 ### Config Panel & Previews
 
-`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has four sections: **Display Mode** (Previews vs List), **Cycle Order** (character list + per-character jump hotkeys), **Keyboard Hotkeys**, and **Preview Windows** (size sliders, show/hide toggle). Changes apply live; saves debounce to disk.
+`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has five sections: **Display Mode** (Previews vs List), **Cycle Order** (character list + per-character jump hotkeys), **Keyboard Hotkeys**, **Preview Windows** (size sliders, show/hide toggle), and **Alerts** (EVE log monitoring). Changes apply live; saves debounce to disk.
 
 Previews and the list window:
 - **Left-click-drag** to reposition; edges snap to adjacent windows
 - **Click without drag** on a preview to foreground that EVE client
 - **Lock positions** in the panel to freeze the layout during play
+
+### Alerts (opt-in)
+
+The Alerts tab tails EVE's Chatlogs and Gamelogs (read-only). Enable it there.
+
+- Preview title strips show `Character  ·  Jita` once a system is known
+- Incoming (↓) / outgoing (↑) DPS from the combat log sit on the left and right of the preview title; they hide when idle and are not mixed with the event banners
+- Taking damage flashes that client's preview chrome red for a moment (coalesced so a volley is one pulse, not a strobe)
+- Inactive clients flash a short banner + gold border for fleet invites, follow/warp, regroups, and compression (decloak / convo / crystal-broke are off by default)
+- Alerts clear when you focus that client
+- On Linux, Nicotine looks for logs in the running EVE client's Wine prefix; override the directories if auto-detect misses
 
 ## Configuration
 

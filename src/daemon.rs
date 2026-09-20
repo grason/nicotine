@@ -1,5 +1,6 @@
-use crate::config::{Config, LiveSettings};
+use crate::config::{Config, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
+use crate::eve_logs;
 use crate::ipc;
 #[cfg(unix)]
 use crate::keyboard_listener::{KeyboardConfig, KeyboardListener};
@@ -62,6 +63,11 @@ pub struct Daemon {
     /// listener.
     #[cfg(unix)]
     keyboard_config: Arc<Mutex<KeyboardConfig>>,
+    /// Live log-monitor settings. Tailer thread snapshots this every
+    /// poll; the hot-reload loop writes panel edits here.
+    logs_config: Arc<Mutex<LogsConfig>>,
+    /// Solar systems + alerts. Preview managers and the tailer share this.
+    log_live: Arc<Mutex<eve_logs::LogLiveState>>,
 }
 
 impl Daemon {
@@ -104,6 +110,8 @@ impl Daemon {
         let mouse_config = Arc::new(Mutex::new(MouseConfig::from_config(&config)));
         #[cfg(unix)]
         let keyboard_config = Arc::new(Mutex::new(KeyboardConfig::from_config(&config)));
+        let logs_config = Arc::new(Mutex::new(config.logs.clone()));
+        let log_live = Arc::new(Mutex::new(eve_logs::LogLiveState::default()));
 
         Self {
             wm,
@@ -114,6 +122,8 @@ impl Daemon {
             mouse_config,
             #[cfg(unix)]
             keyboard_config,
+            logs_config,
+            log_live,
         }
     }
 
@@ -130,6 +140,8 @@ impl Daemon {
         // within ~500ms — no daemon restart needed.
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
+        let logs_config_clone = Arc::clone(&self.logs_config);
+        let mut last_logs = self.config.logs.clone();
         let mut last_order: Option<Vec<String>> = if self.config.characters.is_empty() {
             None
         } else {
@@ -200,6 +212,12 @@ impl Daemon {
                         .unwrap()
                         .set_character_order(new_order.clone());
                     last_order = new_order;
+                }
+
+                if fresh_config.logs != last_logs {
+                    println!("Hot-reload: log monitor config updated");
+                    *logs_config_clone.lock().unwrap() = fresh_config.logs.clone();
+                    last_logs = fresh_config.logs.clone();
                 }
 
                 // Linux input listeners read live bindings from the
@@ -298,10 +316,24 @@ impl Daemon {
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
         let live_clone = Arc::clone(&self.live);
-        match crate::preview_x11::spawn(self.config.clone(), wm_clone, state_clone, live_clone) {
+        match crate::preview_x11::spawn(
+            self.config.clone(),
+            wm_clone,
+            state_clone,
+            live_clone,
+            Arc::clone(&self.logs_config),
+            Arc::clone(&self.log_live),
+        ) {
             Ok(_) => println!("Linux preview manager started (XRender path)"),
             Err(e) => eprintln!("Warning: Could not start Linux preview manager: {}", e),
         }
+
+        eve_logs::spawn(
+            Arc::clone(&self.logs_config),
+            Arc::clone(&self.state),
+            Arc::clone(&self.log_live),
+        );
+        println!("Log monitor spawned (enable via Alerts tab)");
     }
 
     #[cfg(windows)]
@@ -324,13 +356,26 @@ impl Daemon {
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
         let live_clone = Arc::clone(&self.live);
-        match crate::preview_windows::spawn(self.config.clone(), wm_clone, state_clone, live_clone)
-        {
+        match crate::preview_windows::spawn(
+            self.config.clone(),
+            wm_clone,
+            state_clone,
+            live_clone,
+            Arc::clone(&self.logs_config),
+            Arc::clone(&self.log_live),
+        ) {
             Ok(_) => println!("DWM preview windows manager started"),
             Err(e) => {
                 eprintln!("Warning: Could not start preview window manager: {}", e)
             }
         }
+
+        eve_logs::spawn(
+            Arc::clone(&self.logs_config),
+            Arc::clone(&self.state),
+            Arc::clone(&self.log_live),
+        );
+        println!("Log monitor spawned (enable via Alerts tab)");
     }
 
     fn handle_client(&mut self, stream: interprocess::local_socket::Stream) -> Result<()> {

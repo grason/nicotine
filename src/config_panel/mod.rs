@@ -69,6 +69,7 @@ pub(super) enum Tab {
     Display,
     Characters,
     Hotkeys,
+    Alerts,
 }
 
 /// A slider whose value can also be typed into its readout. Centralizes the
@@ -420,6 +421,20 @@ pub(super) enum Message {
     VersionPoll,
     WindowResized(u32, u32),
     CloseRequested,
+    LogsEnabledToggled(bool),
+    ShowSystemToggled(bool),
+    ShowDpsToggled(bool),
+    AlertsInactiveOnlyToggled(bool),
+    AlertSoundToggled(bool),
+    FleetInviteToggled(bool),
+    FollowWarpToggled(bool),
+    RegroupToggled(bool),
+    CompressionToggled(bool),
+    DecloakToggled(bool),
+    ConvoRequestToggled(bool),
+    CrystalBrokeToggled(bool),
+    ChatlogDirChanged(String),
+    GamelogDirChanged(String),
 }
 
 fn update(panel: &mut Panel, message: Message) -> Task<Message> {
@@ -690,6 +705,62 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.config.window_height = h;
                 panel.touch();
             }
+        }
+        Message::LogsEnabledToggled(v) => {
+            panel.config.logs.enabled = v;
+            panel.touch();
+        }
+        Message::ShowSystemToggled(v) => {
+            panel.config.logs.show_system = v;
+            panel.touch();
+        }
+        Message::ShowDpsToggled(v) => {
+            panel.config.logs.show_dps = v;
+            panel.touch();
+        }
+        Message::AlertsInactiveOnlyToggled(v) => {
+            panel.config.logs.alerts_on_inactive_only = v;
+            panel.touch();
+        }
+        Message::AlertSoundToggled(v) => {
+            panel.config.logs.alert_sound = v;
+            panel.touch();
+        }
+        Message::FleetInviteToggled(v) => {
+            panel.config.logs.alerts.fleet_invite = v;
+            panel.touch();
+        }
+        Message::FollowWarpToggled(v) => {
+            panel.config.logs.alerts.follow_warp = v;
+            panel.touch();
+        }
+        Message::RegroupToggled(v) => {
+            panel.config.logs.alerts.regroup = v;
+            panel.touch();
+        }
+        Message::CompressionToggled(v) => {
+            panel.config.logs.alerts.compression = v;
+            panel.touch();
+        }
+        Message::DecloakToggled(v) => {
+            panel.config.logs.alerts.decloak = v;
+            panel.touch();
+        }
+        Message::ConvoRequestToggled(v) => {
+            panel.config.logs.alerts.convo_request = v;
+            panel.touch();
+        }
+        Message::CrystalBrokeToggled(v) => {
+            panel.config.logs.alerts.crystal_broke = v;
+            panel.touch();
+        }
+        Message::ChatlogDirChanged(s) => {
+            panel.config.logs.chatlog_dir = s;
+            panel.touch();
+        }
+        Message::GamelogDirChanged(s) => {
+            panel.config.logs.gamelog_dir = s;
+            panel.touch();
         }
         Message::CloseRequested => {
             // The window is closing — flush a pending edit (e.g. a resize made

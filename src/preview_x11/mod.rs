@@ -36,9 +36,13 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use crate::config::{Config, DisplayMode, LiveSettings};
+use crate::config::{Config, DisplayMode, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
-use crate::preview_common::{preview_should_hide, DragRect, DragState};
+use crate::eve_logs::LogLiveState;
+use crate::preview_common::{
+    dps_in_label, dps_out_label, preview_should_hide, title_label, DragRect, DragState,
+    ALERT_BANNER_PX,
+};
 use crate::preview_positions::PreviewPositions;
 use crate::window_manager::WindowManager;
 
@@ -93,6 +97,8 @@ const PREVIEW_HEIGHT: u16 = 270;
 
 const TITLE_STRIP_HEIGHT: u16 = 24;
 const BORDER_WIDTH: u16 = 3;
+const ALERT_BANNER_HEIGHT: u16 = ALERT_BANNER_PX as u16;
+const DPS_FONT_PX: f32 = 13.0;
 const TITLE_FONT_PX: f32 = 14.0;
 const TITLE_TEXT_LEFT_PAD: i16 = 10;
 
@@ -155,9 +161,11 @@ pub fn spawn(
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
     live: Arc<Mutex<LiveSettings>>,
+    logs_config: Arc<Mutex<LogsConfig>>,
+    log_live: Arc<Mutex<LogLiveState>>,
 ) -> Result<JoinHandle<()>> {
     let handle = std::thread::spawn(move || {
-        if let Err(e) = run_manager(config, wm, state, live) {
+        if let Err(e) = run_manager(config, wm, state, live, logs_config, log_live) {
             eprintln!("Linux preview manager exited with error: {}", e);
         }
     });
@@ -169,6 +177,8 @@ fn run_manager(
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
     live: Arc<Mutex<LiveSettings>>,
+    logs_config: Arc<Mutex<LogsConfig>>,
+    log_live: Arc<Mutex<LogLiveState>>,
 ) -> Result<()> {
     let (conn, screen_num) = x11rb::connect(None).context("X11 connect failed (DISPLAY set?)")?;
     let conn = Arc::new(conn);
@@ -258,6 +268,8 @@ fn run_manager(
         wm,
         state,
         live,
+        logs_config,
+        log_live,
         previews: HashMap::new(),
         visual_format,
         argb32_format,
@@ -310,6 +322,8 @@ struct PreviewManager {
     /// tick to apply slider-driven preview-size changes and the
     /// positions-locked toggle without waiting for save-to-disk.
     live: Arc<Mutex<LiveSettings>>,
+    logs_config: Arc<Mutex<LogsConfig>>,
+    log_live: Arc<Mutex<LogLiveState>>,
     previews: HashMap<String, OwnedPreview>,
     visual_format: u32,
     argb32_format: u32,
@@ -453,6 +467,7 @@ impl PreviewManager {
             DisplayMode::Previews => self.reconcile_previews()?,
             DisplayMode::List => self.reconcile_list()?,
         }
+        self.apply_log_chrome()?;
 
         // Topmost is re-asserted from the focus-change PropertyNotify
         // handler, which is enough for the common case (clicking an EVE
@@ -662,7 +677,11 @@ impl PreviewManager {
                 preview.dirty = true;
             }
 
-            let (thumb_w, thumb_h) = thumbnail_size(want_w, want_h);
+            let banner = self
+                .previews
+                .get(&name)
+                .is_some_and(|p| p.alert_text.is_some());
+            let (thumb_w, thumb_h) = thumbnail_size_with_banner(want_w, want_h, banner);
             let _ = apply_scale_transform(
                 &self.conn,
                 src_picture,
@@ -676,6 +695,258 @@ impl PreviewManager {
             // contents are undefined until we paint.
             let _ = self.paint_preview_now(&name);
         }
+    }
+
+    /// Push solar-system titles and alert banners from the log tailer
+    /// onto preview chrome / list rows. Also drops the focused client's
+    /// alert when `alerts_on_inactive_only` is on.
+    fn apply_log_chrome(&mut self) -> Result<()> {
+        let (enabled, show_system, show_dps, inactive_only) = {
+            let logs = self.logs_config.lock_recover();
+            (
+                logs.enabled,
+                logs.show_system,
+                logs.show_dps,
+                logs.alerts_on_inactive_only,
+            )
+        };
+        let now = Instant::now();
+        if enabled && inactive_only {
+            if let Some(name) = self.active_character.clone() {
+                self.log_live.lock_recover().drop_alert(&name);
+            }
+        }
+
+        let keys: Vec<String> = self.previews.keys().cloned().collect();
+        for name in keys {
+            let (system, alert, dps, taking) = if enabled {
+                let live = self.log_live.lock_recover();
+                let system = if show_system {
+                    live.system_for(&name).map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let alert = live.alert_for(&name, now).map(|a| a.text.clone());
+                let dps = if show_dps { live.dps_for(&name) } else { None };
+                let taking = live.taking_damage(&name, now);
+                (system, alert, dps, taking)
+            } else {
+                (None, None, None, false)
+            };
+            let label = title_label(&name, system.as_deref());
+            let title_changed = self
+                .previews
+                .get(&name)
+                .is_some_and(|p| p.title_label != label);
+            let alert_changed = self
+                .previews
+                .get(&name)
+                .is_some_and(|p| p.alert_text != alert);
+            let (want_dps, in_l, out_l) = match dps {
+                Some(r) if !r.is_idle() => {
+                    (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
+                }
+                _ => (false, String::new(), String::new()),
+            };
+            let dps_changed = self.previews.get(&name).is_some_and(|p| {
+                p.showing_dps != want_dps || p.dps_in_label != in_l || p.dps_out_label != out_l
+            });
+            let flash_changed = self
+                .previews
+                .get(&name)
+                .is_some_and(|p| p.taking_damage != taking);
+            if title_changed {
+                self.rebuild_title_pixmap(&name, &label)?;
+            }
+            if alert_changed {
+                self.rebuild_alert_pixmap(&name, alert.as_deref())?;
+            }
+            if dps_changed {
+                self.rebuild_dps_pixmaps(&name, want_dps, &in_l, &out_l)?;
+            }
+            if flash_changed {
+                if let Some(p) = self.previews.get_mut(&name) {
+                    p.taking_damage = taking;
+                }
+            }
+            if title_changed || alert_changed || dps_changed || flash_changed {
+                if let Some(p) = self.previews.get_mut(&name) {
+                    p.dirty = true;
+                }
+                if alert_changed {
+                    self.recompute_thumb_transform(&name);
+                }
+            }
+        }
+
+        if self.list_window.is_some() {
+            // Force a row rebuild when labels/alerts shifted even if
+            // the character set didn't. update_list_rows no-ops when
+            // last_names + last_row_sig match.
+            self.update_list_rows()?;
+            self.paint_list()?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_title_pixmap(&mut self, key: &str, label: &str) -> Result<()> {
+        let window = match self.previews.get(key) {
+            Some(p) => p.window,
+            None => return Ok(()),
+        };
+        let (pixmap, picture, w, h) = create_text_pixmap(
+            &self.conn,
+            window,
+            label,
+            NICOTINE_CREAM,
+            jetbrains_mono(),
+            TITLE_FONT_PX,
+            self.argb32_format,
+        )?;
+        if let Some(p) = self.previews.get_mut(key) {
+            let _ = self.conn.render_free_picture(p.title_picture);
+            let _ = self.conn.free_pixmap(p.title_pixmap);
+            p.title_pixmap = pixmap;
+            p.title_picture = picture;
+            p.title_text_w = w;
+            p.title_text_h = h;
+            p.title_label = label.to_string();
+        }
+        Ok(())
+    }
+
+    fn rebuild_alert_pixmap(&mut self, key: &str, text: Option<&str>) -> Result<()> {
+        let window = match self.previews.get(key) {
+            Some(p) => p.window,
+            None => return Ok(()),
+        };
+        let new = if let Some(text) = text {
+            let (pixmap, picture, w, h) = create_text_pixmap(
+                &self.conn,
+                window,
+                text,
+                NICOTINE_RED,
+                jetbrains_mono(),
+                TITLE_FONT_PX,
+                self.argb32_format,
+            )?;
+            Some((pixmap, picture, w, h, text.to_string()))
+        } else {
+            None
+        };
+        if let Some(p) = self.previews.get_mut(key) {
+            if let Some(pic) = p.alert_picture.take() {
+                let _ = self.conn.render_free_picture(pic);
+            }
+            if let Some(pix) = p.alert_pixmap.take() {
+                let _ = self.conn.free_pixmap(pix);
+            }
+            if let Some((pixmap, picture, w, h, text)) = new {
+                p.alert_pixmap = Some(pixmap);
+                p.alert_picture = Some(picture);
+                p.alert_text_w = w;
+                p.alert_text_h = h;
+                p.alert_text = Some(text);
+            } else {
+                p.alert_text_w = 0;
+                p.alert_text_h = 0;
+                p.alert_text = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_dps_pixmaps(
+        &mut self,
+        key: &str,
+        showing: bool,
+        in_label: &str,
+        out_label: &str,
+    ) -> Result<()> {
+        let window = match self.previews.get(key) {
+            Some(p) => p.window,
+            None => return Ok(()),
+        };
+        let new_in = if showing {
+            let (pixmap, picture, w, h) = create_text_pixmap(
+                &self.conn,
+                window,
+                in_label,
+                NICOTINE_RED,
+                jetbrains_mono(),
+                DPS_FONT_PX,
+                self.argb32_format,
+            )?;
+            Some((pixmap, picture, w, h))
+        } else {
+            None
+        };
+        let new_out = if showing {
+            let (pixmap, picture, w, h) = create_text_pixmap(
+                &self.conn,
+                window,
+                out_label,
+                NICOTINE_GOLD,
+                jetbrains_mono(),
+                DPS_FONT_PX,
+                self.argb32_format,
+            )?;
+            Some((pixmap, picture, w, h))
+        } else {
+            None
+        };
+        if let Some(p) = self.previews.get_mut(key) {
+            if let Some(pic) = p.dps_in_picture.take() {
+                let _ = self.conn.render_free_picture(pic);
+            }
+            if let Some(pix) = p.dps_in_pixmap.take() {
+                let _ = self.conn.free_pixmap(pix);
+            }
+            if let Some(pic) = p.dps_out_picture.take() {
+                let _ = self.conn.render_free_picture(pic);
+            }
+            if let Some(pix) = p.dps_out_pixmap.take() {
+                let _ = self.conn.free_pixmap(pix);
+            }
+            p.showing_dps = showing;
+            p.dps_in_label = in_label.to_string();
+            p.dps_out_label = out_label.to_string();
+            if let Some((pixmap, picture, w, h)) = new_in {
+                p.dps_in_pixmap = Some(pixmap);
+                p.dps_in_picture = Some(picture);
+                p.dps_in_w = w;
+                p.dps_in_h = h;
+            } else {
+                p.dps_in_w = 0;
+                p.dps_in_h = 0;
+            }
+            if let Some((pixmap, picture, w, h)) = new_out {
+                p.dps_out_pixmap = Some(pixmap);
+                p.dps_out_picture = Some(picture);
+                p.dps_out_w = w;
+                p.dps_out_h = h;
+            } else {
+                p.dps_out_w = 0;
+                p.dps_out_h = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn recompute_thumb_transform(&mut self, key: &str) {
+        let Some(p) = self.previews.get(key) else {
+            return;
+        };
+        let (thumb_w, thumb_h) =
+            thumbnail_size_with_banner(p.width, p.height, p.alert_text.is_some());
+        let _ = apply_scale_transform(
+            &self.conn,
+            p.src_picture,
+            p.source_w,
+            p.source_h,
+            thumb_w,
+            thumb_h,
+        );
     }
 
     /// Enumerate EVE client windows from `_NET_CLIENT_LIST`. Same X11
