@@ -61,6 +61,10 @@ impl PreviewManager {
                     if let Err(e) = self.paint_preview_now(&k) {
                         eprintln!("paint_preview_now({}): {}", k, e);
                     }
+                } else if self.grid_has_damage(ev.damage) {
+                    if let Err(e) = self.paint_grid_damage(ev.damage) {
+                        eprintln!("paint_grid_damage: {}", e);
+                    }
                 }
                 // damage_subtract clears the accumulated damage region
                 // and re-arms the notify. Without this we get exactly
@@ -88,6 +92,12 @@ impl PreviewManager {
                     .is_some_and(|l| l.window == ev.window)
                 {
                     self.paint_list()?;
+                } else if self
+                    .grid_window
+                    .as_ref()
+                    .is_some_and(|g| g.window == ev.window)
+                {
+                    self.paint_grid()?;
                 }
             }
             // Drag lifecycle: press → motion → release. Same code paths
@@ -124,6 +134,11 @@ impl PreviewManager {
                 self.list_window
                     .as_ref()
                     .and_then(|l| (l.window == target_window).then_some(DragTarget::List))
+            })
+            .or_else(|| {
+                self.grid_window
+                    .as_ref()
+                    .and_then(|g| (g.window == target_window).then_some(DragTarget::Grid))
             });
         let Some(target) = target else {
             return Ok(());
@@ -139,6 +154,11 @@ impl PreviewManager {
                 .list_window
                 .as_ref()
                 .map(|l| (l.x as i32, l.y as i32))
+                .unwrap_or((0, 0)),
+            DragTarget::Grid => self
+                .grid_window
+                .as_ref()
+                .map(|g| (g.x as i32, g.y as i32))
                 .unwrap_or((0, 0)),
         };
 
@@ -178,6 +198,15 @@ impl PreviewManager {
                     list.grabbed = grabbed;
                 }
             }
+            DragTarget::Grid => {
+                if let Some(grid) = self.grid_window.as_mut() {
+                    grid.drag.active = true;
+                    grid.drag.dragged = false;
+                    grid.drag.origin_screen = (ev.root_x as i32, ev.root_y as i32);
+                    grid.drag.origin_window = origin_window;
+                    grid.grabbed = grabbed;
+                }
+            }
         }
         Ok(())
     }
@@ -201,6 +230,11 @@ impl PreviewManager {
                 self.list_window
                     .as_ref()
                     .and_then(|l| l.drag.active.then_some(DragTarget::List))
+            })
+            .or_else(|| {
+                self.grid_window
+                    .as_ref()
+                    .and_then(|g| g.drag.active.then_some(DragTarget::Grid))
             });
         let Some(target) = target else {
             return Ok(());
@@ -225,6 +259,16 @@ impl PreviewManager {
                     l.width,
                     l.height,
                     l.window,
+                )
+            }
+            DragTarget::Grid => {
+                let g = self.grid_window.as_ref().unwrap();
+                (
+                    g.drag.origin_screen,
+                    g.drag.origin_window,
+                    g.width,
+                    g.height,
+                    g.window,
                 )
             }
         };
@@ -263,6 +307,13 @@ impl PreviewManager {
                     list.y = new_y;
                 }
             }
+            DragTarget::Grid => {
+                if let Some(grid) = self.grid_window.as_mut() {
+                    grid.drag.dragged = true;
+                    grid.x = new_x;
+                    grid.y = new_y;
+                }
+            }
         }
         let _ = self.conn.configure_window(
             window_id,
@@ -296,6 +347,11 @@ impl PreviewManager {
             .or_else(|| {
                 self.list_window.as_ref().and_then(|l| {
                     (l.window == target_window && l.drag.active).then_some(DragTarget::List)
+                })
+            })
+            .or_else(|| {
+                self.grid_window.as_ref().and_then(|g| {
+                    (g.window == target_window && g.drag.active).then_some(DragTarget::Grid)
                 })
             });
         let Some(target) = target else {
@@ -348,6 +404,27 @@ impl PreviewManager {
                     list.drag.active = false;
                     list.drag.dragged = false;
                     list.grabbed = false;
+                }
+            }
+            DragTarget::Grid => {
+                let (was_dragged, was_grabbed, x, y) = {
+                    let g = self.grid_window.as_ref().unwrap();
+                    (g.drag.dragged, g.grabbed, g.x, g.y)
+                };
+                if was_grabbed {
+                    let _ = self.conn.ungrab_pointer(ev.time);
+                }
+                if was_dragged {
+                    let mut positions = self.positions.lock_recover();
+                    positions.grid_position = Some((x as i32, y as i32));
+                    positions.save();
+                } else {
+                    let _ = self.activate_grid_cell(ev.event_x as i32, ev.event_y as i32);
+                }
+                if let Some(grid) = self.grid_window.as_mut() {
+                    grid.drag.active = false;
+                    grid.drag.dragged = false;
+                    grid.grabbed = false;
                 }
             }
         }

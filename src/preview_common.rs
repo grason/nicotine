@@ -187,6 +187,203 @@ pub fn preview_should_hide(hide_active_setting: bool, is_active: bool) -> bool {
     hide_active_setting && is_active
 }
 
+/// Compact-grid columns. The panel slider uses the same range.
+pub const GRID_COLUMNS_MIN: u32 = 1;
+pub const GRID_COLUMNS_MAX: u32 = 5;
+pub const GRID_COLUMNS_DEFAULT: u32 = 2;
+
+/// Compact-grid cell width in reference pixels (96 DPI). Height is 16:9.
+pub const GRID_CELL_WIDTH_MIN: u32 = 96;
+pub const GRID_CELL_WIDTH_MAX: u32 = 240;
+pub const GRID_CELL_WIDTH_DEFAULT: u32 = 160;
+
+/// Gap between cells, and the gold frame around the whole grid window.
+/// Reference pixels; Windows scales them with the cell size.
+pub const GRID_GAP_PX: i32 = 1;
+pub const GRID_OUTER_BORDER_PX: i32 = 2;
+
+/// Name scrim at the bottom of a cell, and the state border drawn inside
+/// the cell. The thumbnail dest stays above the scrim and inside the
+/// border so it never covers the name or the red/gold frame.
+pub const GRID_SCRIM_PX: i32 = 16;
+pub const GRID_CELL_BORDER_PX: i32 = 2;
+
+/// Character-name size on the scrim. Reference pixels.
+pub const GRID_NAME_FONT_PX: f32 = 12.0;
+
+/// One cell in window coordinates. `x`/`y` are the top-left; `w`/`h`
+/// are the full cell, including the scrim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridCell {
+    pub index: usize,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Axis-aligned box. `w` and `h` are sizes, not exclusive edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Result of [`grid_layout`]. Pixel fields are already scaled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GridLayout {
+    pub window_w: i32,
+    pub window_h: i32,
+    pub cell_w: i32,
+    pub cell_h: i32,
+    pub columns: u32,
+    pub gap: i32,
+    pub outer_border: i32,
+    pub scrim: i32,
+    pub cell_inset: i32,
+    pub cells: Vec<GridCell>,
+}
+
+/// Lay out `count` cells. `columns` clamps to 1–5 and `cell_w` to
+/// 96–240 before scaling, so a hand-edited config cannot produce a
+/// zero-size window. `scale` is 1.0 on Linux and the system DPI scale
+/// on Windows (1.0 at 96 DPI). Width stays `columns` cells wide even
+/// when the last row is short, so the window does not jump narrower
+/// as clients log out. `count == 0` is an empty layout (no window).
+pub fn grid_layout(
+    count: usize,
+    columns: u32,
+    cell_w: u32,
+    gap: i32,
+    outer_border: i32,
+) -> GridLayout {
+    grid_layout_scaled(count, columns, cell_w, gap, outer_border, 1.0)
+}
+
+/// [`grid_layout`] with an explicit DPI scale. Scale is applied after
+/// the reference-pixel clamp.
+pub fn grid_layout_scaled(
+    count: usize,
+    columns: u32,
+    cell_w: u32,
+    gap: i32,
+    outer_border: i32,
+    scale: f32,
+) -> GridLayout {
+    let columns = columns.clamp(GRID_COLUMNS_MIN, GRID_COLUMNS_MAX);
+    let cell_w_ref = cell_w.clamp(GRID_CELL_WIDTH_MIN, GRID_CELL_WIDTH_MAX);
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let cell_w_px = scale_px(cell_w_ref as i32, scale).max(1);
+    let cell_h_px = (cell_w_px * 9 / 16).max(1);
+    let gap_px = scale_px(gap.max(0), scale).max(0);
+    let border_px = scale_px(outer_border.max(0), scale).max(0);
+    let scrim = scale_px(GRID_SCRIM_PX, scale).clamp(1, cell_h_px);
+    let cell_inset = scale_px(GRID_CELL_BORDER_PX, scale).clamp(0, cell_w_px / 4);
+
+    if count == 0 {
+        return GridLayout {
+            window_w: 0,
+            window_h: 0,
+            cell_w: cell_w_px,
+            cell_h: cell_h_px,
+            columns,
+            gap: gap_px,
+            outer_border: border_px,
+            scrim,
+            cell_inset,
+            cells: Vec::new(),
+        };
+    }
+
+    let cols = columns as usize;
+    let rows = count.div_ceil(cols);
+    let window_w = border_px * 2 + cols as i32 * cell_w_px + (cols as i32 - 1) * gap_px;
+    let window_h = border_px * 2 + rows as i32 * cell_h_px + (rows as i32 - 1) * gap_px;
+
+    let mut cells = Vec::with_capacity(count);
+    for index in 0..count {
+        let col = (index % cols) as i32;
+        let row = (index / cols) as i32;
+        cells.push(GridCell {
+            index,
+            x: border_px + col * (cell_w_px + gap_px),
+            y: border_px + row * (cell_h_px + gap_px),
+            w: cell_w_px,
+            h: cell_h_px,
+        });
+    }
+
+    GridLayout {
+        window_w,
+        window_h,
+        cell_w: cell_w_px,
+        cell_h: cell_h_px,
+        columns,
+        gap: gap_px,
+        outer_border: border_px,
+        scrim,
+        cell_inset,
+        cells,
+    }
+}
+
+fn scale_px(n: i32, scale: f32) -> i32 {
+    (n as f32 * scale).round() as i32
+}
+
+/// Rectangle the thumbnail is allowed to occupy: inside the state
+/// border, and above the name scrim. Painting the thumbnail here keeps
+/// it off the name and off the red/gold frame.
+pub fn grid_thumb_bounds(cell: GridCell, inset: i32, scrim: i32) -> GridRect {
+    let inset = inset.max(0);
+    let scrim = scrim.max(0);
+    let x = cell.x + inset;
+    let y = cell.y + inset;
+    let w = (cell.w - inset * 2).max(1);
+    let h = (cell.h - scrim - inset).max(1);
+    GridRect { x, y, w, h }
+}
+
+/// Letterbox `src_w`×`src_h` inside `bounds`. A zero source fills the
+/// bounds. The result is centered and never larger than `bounds`.
+pub fn fit_contain(src_w: i32, src_h: i32, bounds: GridRect) -> GridRect {
+    if src_w <= 0 || src_h <= 0 || bounds.w <= 0 || bounds.h <= 0 {
+        return bounds;
+    }
+    let src_aspect = src_w as f64 / src_h as f64;
+    let box_aspect = bounds.w as f64 / bounds.h as f64;
+    let (dw, dh) = if src_aspect > box_aspect {
+        let dw = bounds.w;
+        let dh = ((bounds.w as f64) / src_aspect).round() as i32;
+        (dw, dh.max(1))
+    } else {
+        let dh = bounds.h;
+        let dw = ((bounds.h as f64) * src_aspect).round() as i32;
+        (dw.max(1), dh)
+    };
+    GridRect {
+        x: bounds.x + (bounds.w - dw) / 2,
+        y: bounds.y + (bounds.h - dh) / 2,
+        w: dw.min(bounds.w),
+        h: dh.min(bounds.h),
+    }
+}
+
+/// Cell index under a window-local point, or `None` when the point is
+/// on the frame or in a gap.
+pub fn grid_cell_at(cells: &[GridCell], x: i32, y: i32) -> Option<usize> {
+    cells.iter().find_map(|cell| {
+        let inside = x >= cell.x && y >= cell.y && x < cell.x + cell.w && y < cell.y + cell.h;
+        inside.then_some(cell.index)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +705,127 @@ mod tests {
         let (a_active, b_active) = (false, true);
         assert!(!preview_should_hide(on, a_active));
         assert!(preview_should_hide(on, b_active));
+    }
+
+    #[test]
+    fn grid_default_twenty_clients_is_a_side_dock() {
+        // 2×160 cells, 16:9, 1px gaps, 2px frame.
+        // width  = 4 + 2*160 + 1 = 325
+        // height = 4 + 10*90 + 9 = 913
+        let layout = grid_layout(20, 2, 160, GRID_GAP_PX, GRID_OUTER_BORDER_PX);
+        assert_eq!(layout.columns, 2);
+        assert_eq!((layout.cell_w, layout.cell_h), (160, 90));
+        assert_eq!((layout.window_w, layout.window_h), (325, 913));
+        assert_eq!(layout.cells.len(), 20);
+        assert_eq!(
+            (layout.cells[0].x, layout.cells[0].y),
+            (GRID_OUTER_BORDER_PX, GRID_OUTER_BORDER_PX)
+        );
+        assert_eq!((layout.cells[1].x, layout.cells[1].y), (163, 2));
+        // Next row starts under the first cell, past one gap.
+        assert_eq!((layout.cells[2].x, layout.cells[2].y), (2, 93));
+    }
+
+    #[test]
+    fn grid_partial_last_row_stays_left_aligned() {
+        let layout = grid_layout(19, 2, 160, 1, 2);
+        assert_eq!(layout.cells.len(), 19);
+        // 10 rows either way — the short last row does not shrink the window.
+        assert_eq!(layout.window_h, grid_layout(20, 2, 160, 1, 2).window_h);
+        let last = layout.cells[18];
+        assert_eq!(last.index, 18);
+        assert_eq!(last.x, 2);
+        assert_eq!(last.y, 2 + 9 * (90 + 1));
+    }
+
+    #[test]
+    fn grid_one_client_keeps_the_column_width() {
+        let layout = grid_layout(1, 2, 160, 1, 2);
+        assert_eq!(layout.window_w, 325);
+        assert_eq!(layout.window_h, 2 * 2 + 90);
+        assert_eq!(layout.cells.len(), 1);
+    }
+
+    #[test]
+    fn grid_zero_clients_is_empty() {
+        let layout = grid_layout(0, 2, 160, 1, 2);
+        assert_eq!((layout.window_w, layout.window_h), (0, 0));
+        assert!(layout.cells.is_empty());
+    }
+
+    #[test]
+    fn grid_clamps_columns_and_cell_width() {
+        let wide = grid_layout(1, 9, 999, 1, 2);
+        assert_eq!(wide.columns, GRID_COLUMNS_MAX);
+        assert_eq!(wide.cell_w, GRID_CELL_WIDTH_MAX as i32);
+        let tiny = grid_layout(1, 0, 10, 1, 2);
+        assert_eq!(tiny.columns, GRID_COLUMNS_MIN);
+        assert_eq!(tiny.cell_w, GRID_CELL_WIDTH_MIN as i32);
+    }
+
+    #[test]
+    fn grid_scale_two_doubles_the_default_cell() {
+        let layout = grid_layout_scaled(1, 2, 160, 1, 2, 2.0);
+        assert_eq!((layout.cell_w, layout.cell_h), (320, 180));
+        assert_eq!(layout.gap, 2);
+        assert_eq!(layout.outer_border, 4);
+        assert_eq!(layout.scrim, 32);
+    }
+
+    #[test]
+    fn grid_hit_test_ignores_frame_and_gap() {
+        let layout = grid_layout(4, 2, 160, 1, 2);
+        assert_eq!(grid_cell_at(&layout.cells, 2, 2), Some(0));
+        assert_eq!(grid_cell_at(&layout.cells, 161, 2), Some(0));
+        assert_eq!(grid_cell_at(&layout.cells, 162, 2), None);
+        assert_eq!(grid_cell_at(&layout.cells, 163, 2), Some(1));
+        assert_eq!(grid_cell_at(&layout.cells, 0, 0), None);
+        assert_eq!(grid_cell_at(&layout.cells, 2, 93), Some(2));
+    }
+
+    #[test]
+    fn grid_thumb_bounds_stay_above_the_scrim() {
+        let cell = GridCell {
+            index: 0,
+            x: 2,
+            y: 2,
+            w: 160,
+            h: 90,
+        };
+        let bounds = grid_thumb_bounds(cell, 2, 16);
+        assert_eq!(
+            bounds,
+            GridRect {
+                x: 4,
+                y: 4,
+                w: 156,
+                h: 72
+            }
+        );
+    }
+
+    #[test]
+    fn fit_contain_letterboxes_wide_and_tall_sources() {
+        let bounds = GridRect {
+            x: 10,
+            y: 20,
+            w: 160,
+            h: 74,
+        };
+        // 16:9 into a wider box: fit the height, center horizontally.
+        let wide = fit_contain(1920, 1080, bounds);
+        assert_eq!(wide.h, 74);
+        assert_eq!(wide.w, 132);
+        assert_eq!(wide.x, 24);
+        assert_eq!(wide.y, 20);
+
+        // Wider than the box: fit the width, center vertically.
+        let cinematic = fit_contain(320, 100, bounds);
+        assert_eq!(cinematic.w, 160);
+        assert_eq!(cinematic.h, 50);
+        assert_eq!(cinematic.x, 10);
+        assert_eq!(cinematic.y, 32);
+
+        assert_eq!(fit_contain(0, 0, bounds), bounds);
     }
 }

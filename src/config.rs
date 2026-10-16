@@ -18,11 +18,14 @@ pub struct CharacterHotkey {
 /// How the visible-at-a-glance view of clients is rendered.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
-    /// One DWM thumbnail window per EVE client (default).
+    /// One thumbnail window per EVE client (default).
     Previews,
     /// A single always-on-top window listing each character name. Active
     /// character shown in Nicotine red with a 🚬 marker.
     List,
+    /// One always-on-top window tiling every logged-in client as a live
+    /// thumbnail, in cycle order. The compact view for a lot of accounts.
+    Grid,
 }
 
 /// Settings that components watch for *live* changes — e.g. the preview
@@ -54,6 +57,11 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Compact-grid columns. Read live so the slider resizes the grid
+    /// without a disk round-trip.
+    pub grid_columns: u32,
+    /// Compact-grid cell width in reference pixels (96 DPI).
+    pub grid_cell_width: u32,
 }
 
 impl LiveSettings {
@@ -66,6 +74,8 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            grid_columns: config.grid_columns,
+            grid_cell_width: config.grid_cell_width,
         }))
     }
 }
@@ -146,6 +156,13 @@ pub struct Config {
     /// Which on-screen representation of running clients Nicotine shows.
     #[serde(default = "default_display_mode")]
     pub display_mode: DisplayMode,
+    /// Columns in compact-grid mode. The panel clamps this to 1–5.
+    #[serde(default = "default_grid_columns")]
+    pub grid_columns: u32,
+    /// Cell width in reference pixels (96 DPI) for compact-grid mode.
+    /// Cell height is `width * 9 / 16`.
+    #[serde(default = "default_grid_cell_width")]
+    pub grid_cell_width: u32,
     /// When true, drag is disabled on preview windows and the client
     /// list so they can't accidentally move during gameplay.
     #[serde(default)]
@@ -367,6 +384,14 @@ fn default_display_mode() -> DisplayMode {
     DisplayMode::Previews
 }
 
+fn default_grid_columns() -> u32 {
+    crate::preview_common::GRID_COLUMNS_DEFAULT
+}
+
+fn default_grid_cell_width() -> u32 {
+    crate::preview_common::GRID_CELL_WIDTH_DEFAULT
+}
+
 fn default_window_width() -> u32 {
     720
 }
@@ -489,6 +514,8 @@ impl Config {
             toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: default_display_mode(),
+            grid_columns: default_grid_columns(),
+            grid_cell_width: default_grid_cell_width(),
             positions_locked: false,
             character_hotkeys: HashMap::new(),
             window_width: default_window_width(),
@@ -576,6 +603,8 @@ mod tests {
             toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            grid_columns: 2,
+            grid_cell_width: 160,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
             logs: LogsConfig::default(),
@@ -616,6 +645,8 @@ mod tests {
             toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            grid_columns: 2,
+            grid_cell_width: 160,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
             logs: LogsConfig::default(),
@@ -655,6 +686,8 @@ mod tests {
             toggle_previews_modifier: Some(42),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            grid_columns: 2,
+            grid_cell_width: 160,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
             logs: LogsConfig::default(),
@@ -716,6 +749,31 @@ eve_height = 1080
         assert!(parsed.logs.alerts.fleet_invite);
         assert!(!parsed.logs.alerts.decloak);
         assert_eq!(parsed.logs.alert_secs, 8);
+        assert_eq!(parsed.display_mode, DisplayMode::Previews);
+        assert_eq!(parsed.grid_columns, 2);
+        assert_eq!(parsed.grid_cell_width, 160);
+    }
+
+    #[test]
+    fn grid_settings_round_trip() {
+        let toml_str = r#"
+display_width = 1920
+display_height = 1080
+panel_height = 0
+eve_width = 1000
+eve_height = 1080
+display_mode = "Grid"
+grid_columns = 4
+grid_cell_width = 128
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.display_mode, DisplayMode::Grid);
+        assert_eq!(parsed.grid_columns, 4);
+        assert_eq!(parsed.grid_cell_width, 128);
+        let again: Config = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(again.display_mode, DisplayMode::Grid);
+        assert_eq!(again.grid_columns, 4);
+        assert_eq!(again.grid_cell_width, 128);
     }
 
     #[test]
@@ -759,6 +817,8 @@ eve_height = 1080
             toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            grid_columns: 2,
+            grid_cell_width: 160,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
             logs,

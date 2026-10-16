@@ -19,6 +19,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Instant client cycling** with mouse buttons (forward/backward) or targeted switching (jump to client N)
 - **Live preview windows** per EVE client — XComposite + XRender on Linux, DWM thumbnails on Windows
 - **List display mode** — compact roster window as an alternative to per-client previews
+- **Compact grid** — one window of live thumbnails, for a lot of accounts
 - **Config panel** for character order, per-character jump hotkeys, preview sizing, and display mode
 - **Daemon architecture** for near-zero-latency window switching
 - **Auto-stack windows** to perfectly center multiple EVE clients
@@ -211,7 +212,7 @@ eve_height = 1080
 show_previews = true       # Spawn preview windows (false = daemon-only)
 preview_width = 320        # Preview window width in px
 preview_height = 180       # Preview window height in px
-display_mode = "Previews"  # "Previews" or "List"
+display_mode = "Previews"  # "Previews", "Grid", or "List"
 positions_locked = false   # Disable drag on previews + list
 enable_mouse_buttons = true
 forward_button = 276       # Button 9

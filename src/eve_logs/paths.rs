@@ -43,10 +43,10 @@ fn auto_dirs() -> LogDirs {
     {
         let docs = dirs::document_dir().unwrap_or_else(|| PathBuf::from("."));
         let logs = docs.join("EVE").join("logs");
-        return LogDirs {
+        LogDirs {
             chatlogs: logs.join("Chatlogs"),
             gamelogs: logs.join("Gamelogs"),
-        };
+        }
     }
     #[cfg(unix)]
     {
@@ -121,6 +121,8 @@ fn wine_prefix_of(pid: u32) -> Option<PathBuf> {
 }
 
 /// Public so tests can feed a fake prefix without touching /proc.
+/// The shipping Windows binary resolves logs from Documents instead.
+#[cfg_attr(all(windows, not(test)), allow(dead_code))]
 pub fn logs_under_prefix(prefix: &Path) -> Option<LogDirs> {
     let users = prefix.join("drive_c").join("users");
     let steamuser = users

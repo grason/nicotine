@@ -19,6 +19,10 @@ pub struct PreviewPositions {
     /// Linux ships List mode in a later phase.
     #[serde(default)]
     pub list_position: Option<(i32, i32)>,
+    /// Last-known position of the compact-grid window. Same restore
+    /// rules as `list_position`.
+    #[serde(default)]
+    pub grid_position: Option<(i32, i32)>,
 }
 
 impl PreviewPositions {

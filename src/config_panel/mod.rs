@@ -86,6 +86,10 @@ pub(super) enum SliderField {
     /// Drives width; height follows from the locked ratio. Reuses the
     /// width range so the editable readout / clamp logic is shared.
     PreviewSize,
+    /// Compact-grid column count.
+    GridColumns,
+    /// Compact-grid cell width in reference pixels.
+    GridCellWidth,
 }
 
 impl SliderField {
@@ -94,6 +98,13 @@ impl SliderField {
             SliderField::PreviewWidth | SliderField::PreviewSize => 120..=800,
             SliderField::PreviewHeight => 80..=600,
             SliderField::PreviewOpacity => 10..=100,
+            SliderField::GridColumns => {
+                crate::preview_common::GRID_COLUMNS_MIN..=crate::preview_common::GRID_COLUMNS_MAX
+            }
+            SliderField::GridCellWidth => {
+                crate::preview_common::GRID_CELL_WIDTH_MIN
+                    ..=crate::preview_common::GRID_CELL_WIDTH_MAX
+            }
         }
     }
 
@@ -105,6 +116,8 @@ impl SliderField {
             SliderField::PreviewHeight => Message::PreviewHeightChanged(value),
             SliderField::PreviewOpacity => Message::PreviewOpacityChanged(value),
             SliderField::PreviewSize => Message::PreviewSizeChanged(value),
+            SliderField::GridColumns => Message::GridColumnsChanged(value),
+            SliderField::GridCellWidth => Message::GridCellWidthChanged(value),
         }
     }
 
@@ -123,6 +136,8 @@ impl SliderField {
             SliderField::PreviewWidth | SliderField::PreviewSize => panel.config.preview_width,
             SliderField::PreviewHeight => panel.config.preview_height,
             SliderField::PreviewOpacity => panel.config.preview_opacity,
+            SliderField::GridColumns => panel.config.grid_columns,
+            SliderField::GridCellWidth => panel.config.grid_cell_width,
         }
     }
 }
@@ -278,6 +293,11 @@ impl Panel {
             config.preview_opacity.to_string(),
         );
         slider_text.insert(SliderField::PreviewSize, config.preview_width.to_string());
+        slider_text.insert(SliderField::GridColumns, config.grid_columns.to_string());
+        slider_text.insert(
+            SliderField::GridCellWidth,
+            config.grid_cell_width.to_string(),
+        );
         let aspect_ratio = aspect_ratio_of(config.preview_width, config.preview_height);
 
         // Hide Restack where it can't work. Only GNOME Wayland blocks
@@ -414,6 +434,8 @@ pub(super) enum Message {
     PreviewHeightChanged(u32),
     PreviewSizeChanged(u32),
     PreviewOpacityChanged(u32),
+    GridColumnsChanged(u32),
+    GridCellWidthChanged(u32),
     SliderTextChanged(SliderField, String),
     SliderTextCommit(SliderField),
     OpenLink(String),
@@ -644,6 +666,22 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel
                 .slider_text
                 .insert(SliderField::PreviewOpacity, o.to_string());
+            panel.touch();
+        }
+        Message::GridColumnsChanged(n) => {
+            panel.config.grid_columns = n;
+            panel.live.lock().unwrap().grid_columns = n;
+            panel
+                .slider_text
+                .insert(SliderField::GridColumns, n.to_string());
+            panel.touch();
+        }
+        Message::GridCellWidthChanged(w) => {
+            panel.config.grid_cell_width = w;
+            panel.live.lock().unwrap().grid_cell_width = w;
+            panel
+                .slider_text
+                .insert(SliderField::GridCellWidth, w.to_string());
             panel.touch();
         }
         Message::SliderTextChanged(field, s) => {
@@ -1341,6 +1379,8 @@ mod tests {
             SliderField::PreviewHeight,
             SliderField::PreviewOpacity,
             SliderField::PreviewSize,
+            SliderField::GridColumns,
+            SliderField::GridCellWidth,
         ] {
             let r = field.range();
             assert_eq!(field.parse_input("999999"), Some(*r.end()));

@@ -133,6 +133,9 @@ fn px(n: i32) -> i32 {
 const PREVIEW_CLASS: &str = "NicotinePreviewWnd\0";
 const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
 const LIST_CLASS: &str = "NicotineListWnd\0";
+const GRID_CLASS: &str = "NicotineGridWnd\0";
+
+mod grid;
 
 // Chrome dimensions below are "reference pixels" at 96 DPI. Every use
 // site wraps them in `px(...)` so they render at the correct physical
@@ -246,6 +249,11 @@ struct PreviewManager {
     /// Optional single-window list view; populated when `display_mode` is
     /// `List`. Drop destroys the window.
     list: Option<OwnedListWindow>,
+    /// Compact-grid window. `None` in the other display modes.
+    grid: Option<grid::OwnedGrid>,
+    /// Last paint key for the grid. Invalidate only when it changes so
+    /// the 100ms reconcile does not flicker the window.
+    grid_key: String,
     /// Most recent foreground EVE window id. Used by the list window's
     /// paint callback to decide which row to highlight.
     active_id: u32,
@@ -309,6 +317,10 @@ impl PreviewManager {
                 self.list = None;
                 self.list_last_names.clear();
             }
+            if self.grid.is_some() {
+                self.grid = None;
+                self.grid_key.clear();
+            }
             return;
         }
 
@@ -316,16 +328,32 @@ impl PreviewManager {
         // reconcile; if so, tear down the outgoing mode's windows.
         if target_mode != self.current_mode {
             match target_mode {
-                crate::config::DisplayMode::Previews => self.list = None,
-                crate::config::DisplayMode::List => self.previews.clear(),
+                crate::config::DisplayMode::Previews => {
+                    self.list = None;
+                    self.grid = None;
+                }
+                crate::config::DisplayMode::List => {
+                    self.previews.clear();
+                    self.grid = None;
+                }
+                crate::config::DisplayMode::Grid => {
+                    self.previews.clear();
+                    self.list = None;
+                    self.list_last_names.clear();
+                }
             }
+            self.grid_key.clear();
             self.current_mode = target_mode;
         }
 
         match self.current_mode {
             crate::config::DisplayMode::Previews => self.reconcile_previews(),
             crate::config::DisplayMode::List => self.reconcile_list(),
+            crate::config::DisplayMode::Grid => self.reconcile_grid(),
         }
+        // Grid mode does not go through reconcile_previews, which is
+        // where the opacity slider is normally pushed.
+        self.apply_live_opacity();
 
         // Polling fallback in case the WinEvent hook missed something
         // (rare). The hook is the primary path and updates instantly.
@@ -566,6 +594,9 @@ impl PreviewManager {
         for preview in self.previews.values() {
             apply_window_opacity(preview.hwnd, want);
         }
+        if let Some(grid) = &self.grid {
+            apply_window_opacity(grid.hwnd, want);
+        }
     }
 
     /// Hide the active client's preview (and reveal everything else) when
@@ -610,16 +641,7 @@ impl PreviewManager {
         };
         let now = Instant::now();
         if enabled && inactive_only {
-            let active_name = self.previews.iter().find_map(|(name, p)| {
-                if p.source_id == self.active_id {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            });
-            if let Some(name) = active_name {
-                self.log_live.lock().unwrap().drop_alert(&name);
-            }
+            self.drop_focused_alert();
         }
 
         for (name, preview) in &self.previews {
@@ -689,6 +711,40 @@ impl PreviewManager {
                     }
                 }
             }
+        }
+
+        // Recomputed after the focused alert is dropped, so a focus
+        // change in this same tick does not leave the old label up.
+        if self.grid.is_some() {
+            let windows = {
+                let state = self.state.lock().unwrap();
+                state.get_ordered_windows()
+            };
+            self.invalidate_grid_if_changed(&windows);
+        }
+    }
+
+    /// Clear the focused client's alert when inactive-only alerts are on.
+    /// List and grid mode do not keep `self.previews`, so the name comes
+    /// from the cycle list. No-op when the setting is off.
+    fn drop_focused_alert(&mut self) {
+        let should_drop = {
+            let logs = self.logs_config.lock().unwrap();
+            logs.enabled && logs.alerts_on_inactive_only
+        };
+        if !should_drop {
+            return;
+        }
+        let active_name = {
+            let state = self.state.lock().unwrap();
+            state
+                .get_windows()
+                .iter()
+                .find(|w| w.id == self.active_id)
+                .map(|w| w.title.clone())
+        };
+        if let Some(name) = active_name {
+            self.log_live.lock().unwrap().drop_alert(&name);
         }
     }
 
@@ -783,9 +839,18 @@ impl PreviewManager {
         // need to erase first (and erase + paint flickers).
         if self.active_id != active_id {
             self.active_id = active_id;
+            // Consume the alert before the repaint. Otherwise a fast
+            // cycle away brings the banner back on a client the user
+            // already looked at.
+            self.drop_focused_alert();
             if let Some(list) = &self.list {
                 unsafe {
                     let _ = InvalidateRect(Some(list.hwnd), None, false);
+                }
+            }
+            if let Some(grid) = &self.grid {
+                unsafe {
+                    let _ = InvalidateRect(Some(grid.hwnd), None, false);
                 }
             }
         }
@@ -1591,6 +1656,24 @@ fn register_classes(module: HMODULE) -> Result<()> {
             hIconSm: HICON::default(),
         };
         let _ = RegisterClassExW(&list_wc);
+
+        let grid_bg = CreateSolidBrush(CHROME_DARK);
+        let grid_class: Vec<u16> = GRID_CLASS.encode_utf16().collect();
+        let grid_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: Default::default(),
+            lpfnWndProc: Some(grid::grid_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: module.into(),
+            hIcon: HICON::default(),
+            hCursor: cursor,
+            hbrBackground: grid_bg,
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(grid_class.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        let _ = RegisterClassExW(&grid_wc);
     }
     Ok(())
 }
@@ -1669,6 +1752,8 @@ fn run_manager(
         log_live,
         current_mode: initial_mode,
         list: None,
+        grid: None,
+        grid_key: String::new(),
         active_id: 0,
         list_last_names: Vec::new(),
         list_last_rows: Vec::new(),

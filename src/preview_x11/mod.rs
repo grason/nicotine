@@ -134,6 +134,7 @@ const LIST_ROW_TOP_PAD: i16 = 14;
 const LIST_BOTTOM_PAD: u16 = 12;
 
 mod events;
+mod grid;
 mod list;
 mod preview;
 mod render;
@@ -282,6 +283,8 @@ fn run_manager(
         last_applied_opacity,
         current_mode: initial_mode,
         list_window: None,
+        grid_window: None,
+        grid_ids: HashMap::new(),
         needs_window_scan: true,
         last_window_scan: Instant::now(),
     };
@@ -360,6 +363,13 @@ struct PreviewManager {
     /// The single list-view window (Display Mode = List). `None` when
     /// the user is in Previews mode.
     list_window: Option<OwnedListWindow>,
+    /// Compact-grid window. `None` in the other display modes and when
+    /// no EVE client is logged in.
+    grid_window: Option<grid::OwnedGrid>,
+    /// Title → X11 id from the last `find_eve_windows` scan. Joined
+    /// with `get_ordered_windows` so the grid follows cycle order
+    /// without a round-trip on every tick.
+    grid_ids: HashMap<String, u32>,
     /// Set when an _NET_CLIENT_LIST PropertyNotify fires (or on first
     /// tick) so the next reconcile knows it needs the sync round-trip
     /// window enumeration. Without this we'd re-enumerate every 100ms,
@@ -433,10 +443,13 @@ impl PreviewManager {
             if self.list_window.is_some() {
                 self.list_window = None;
             }
+            if self.grid_window.is_some() {
+                self.grid_window = None;
+            }
             // Stay quiet — don't run the rest of reconcile.
             return Ok(());
         }
-        if self.previews.is_empty() && self.list_window.is_none() {
+        if self.previews.is_empty() && self.list_window.is_none() && self.grid_window.is_none() {
             // Either we just toggled back on or we started clean;
             // either way, re-enumerate EVE windows on the next
             // reconcile_previews pass.
@@ -450,14 +463,19 @@ impl PreviewManager {
         if target_mode != self.current_mode {
             match target_mode {
                 DisplayMode::Previews => {
-                    // OwnedListWindow::drop frees its row pictures,
-                    // title pixmap, dst picture, and destroys the window.
+                    // Drop the other mode's surfaces before previews
+                    // redirect the same EVE windows.
                     self.list_window = None;
+                    self.grid_window = None;
                 }
                 DisplayMode::List => {
-                    // OwnedPreview::drop unredirects each source EVE
-                    // window and tears down per-preview resources.
                     self.previews.clear();
+                    self.grid_window = None;
+                }
+                DisplayMode::Grid => {
+                    self.previews.clear();
+                    self.list_window = None;
+                    self.needs_window_scan = true;
                 }
             }
             self.current_mode = target_mode;
@@ -466,7 +484,11 @@ impl PreviewManager {
         match self.current_mode {
             DisplayMode::Previews => self.reconcile_previews()?,
             DisplayMode::List => self.reconcile_list()?,
+            DisplayMode::Grid => self.reconcile_grid()?,
         }
+        // Grid mode does not go through reconcile_previews, which is
+        // where the opacity slider is normally pushed.
+        self.apply_live_opacity();
         self.apply_log_chrome()?;
 
         // Topmost is re-asserted from the focus-change PropertyNotify
@@ -494,6 +516,12 @@ impl PreviewManager {
         if let Some(list) = &self.list_window {
             let _ = self.conn.configure_window(
                 list.window,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            );
+        }
+        if let Some(grid) = &self.grid_window {
+            let _ = self.conn.configure_window(
+                grid.window,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
             );
         }
@@ -590,6 +618,15 @@ impl PreviewManager {
             let _ = self.conn.change_property32(
                 PropMode::REPLACE,
                 preview.window,
+                self.atoms.net_wm_window_opacity,
+                AtomEnum::CARDINAL,
+                &[cardinal],
+            );
+        }
+        if let Some(grid) = &self.grid_window {
+            let _ = self.conn.change_property32(
+                PropMode::REPLACE,
+                grid.window,
                 self.atoms.net_wm_window_opacity,
                 AtomEnum::CARDINAL,
                 &[cardinal],
@@ -697,6 +734,22 @@ impl PreviewManager {
         }
     }
 
+    /// Clear the focused client's alert when inactive-only alerts are on.
+    /// No-op when the setting is off. Uses the character name resolved
+    /// by `update_active` so list and grid mode agree with previews.
+    fn drop_focused_alert(&mut self) {
+        let should_drop = {
+            let logs = self.logs_config.lock_recover();
+            logs.enabled && logs.alerts_on_inactive_only
+        };
+        if !should_drop {
+            return;
+        }
+        if let Some(name) = self.active_character.clone() {
+            self.log_live.lock_recover().drop_alert(&name);
+        }
+    }
+
     /// Push solar-system titles and alert banners from the log tailer
     /// onto preview chrome / list rows. Also drops the focused client's
     /// alert when `alerts_on_inactive_only` is on.
@@ -712,9 +765,7 @@ impl PreviewManager {
         };
         let now = Instant::now();
         if enabled && inactive_only {
-            if let Some(name) = self.active_character.clone() {
-                self.log_live.lock_recover().drop_alert(&name);
-            }
+            self.drop_focused_alert();
         }
 
         let keys: Vec<String> = self.previews.keys().cloned().collect();
@@ -785,6 +836,11 @@ impl PreviewManager {
             // last_names + last_row_sig match.
             self.update_list_rows()?;
             self.paint_list()?;
+        }
+        if self.grid_window.is_some() {
+            // Runs after the focused client's alert is dropped, so the
+            // grid paint in this same tick sees the cleared banner.
+            self.refresh_grid_chrome()?;
         }
         Ok(())
     }
@@ -1112,6 +1168,16 @@ impl PreviewManager {
                 });
             }
         }
+        if let Some(grid) = &self.grid_window {
+            if !matches!(dragged, DragTarget::Grid) {
+                rects.push(DragRect {
+                    left: grid.x as i32,
+                    top: grid.y as i32,
+                    right: grid.x as i32 + grid.width as i32,
+                    bottom: grid.y as i32 + grid.height as i32,
+                });
+            }
+        }
         rects
     }
 
@@ -1160,7 +1226,11 @@ impl PreviewManager {
             || self
                 .list_window
                 .as_ref()
-                .is_some_and(|l| l.window == new_active);
+                .is_some_and(|l| l.window == new_active)
+            || self
+                .grid_window
+                .as_ref()
+                .is_some_and(|g| g.window == new_active);
         if is_our_window {
             return Ok(());
         }
@@ -1185,6 +1255,10 @@ impl PreviewManager {
         }
         self.active_id = new_active;
         self.active_character = new_active_character;
+        // Consume the alert before the grid repaint below. A cycle that
+        // lands and leaves again inside one reconcile tick would otherwise
+        // show the banner on a client the user already looked at.
+        self.drop_focused_alert();
 
         // Per-preview chrome flip in Previews mode. Collect keys first
         // to avoid mutable / immutable borrow tangles.
@@ -1219,6 +1293,9 @@ impl PreviewManager {
         if matches!(self.current_mode, DisplayMode::List) {
             let _ = self.paint_list();
         }
+        if matches!(self.current_mode, DisplayMode::Grid) {
+            let _ = self.refresh_grid_chrome();
+        }
 
         Ok(())
     }
@@ -1241,6 +1318,7 @@ pub(super) fn opacity_to_cardinal(percent: u32) -> u32 {
 enum DragTarget {
     Preview(String),
     List,
+    Grid,
 }
 
 /// Read the X server's notion of the current foreground window.

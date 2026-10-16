@@ -8,6 +8,7 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 
 use crate::config::DisplayMode;
+use crate::preview_common::{grid_layout, GRID_GAP_PX, GRID_OUTER_BORDER_PX};
 
 use super::{
     code_to_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
@@ -233,12 +234,19 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
         section_header("Display Mode"),
         caption(
             "How Nicotine shows your running clients on screen. Preview windows mirror each \
-             client live; the list view is a compact always-on-top window of names."
+             client live. Compact grid is one window of live thumbnails, for a lot of accounts. \
+             The list view is a compact always-on-top window of names."
         ),
         row![
             radio(
                 "Preview windows",
                 DisplayMode::Previews,
+                Some(panel.config.display_mode),
+                Message::DisplayModeChanged,
+            ),
+            radio(
+                "Compact grid",
+                DisplayMode::Grid,
                 Some(panel.config.display_mode),
                 Message::DisplayModeChanged,
             ),
@@ -251,7 +259,7 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
         ]
         .spacing(16),
         checkbox(panel.config.positions_locked)
-            .label("Lock positions (drag disabled on previews and list)")
+            .label("Lock positions (drag disabled on previews, grid, and list)")
             .on_toggle(Message::LockToggled),
     ]
     .spacing(8);
@@ -526,15 +534,42 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.hide_active_preview)
             .label("Hide the active client's preview")
             .on_toggle(Message::HideActivePreviewToggled),
-        checkbox(panel.config.constrain_aspect)
-            .label("Constrain aspect ratio")
-            .on_toggle(Message::ConstrainAspectToggled),
     ]
     .spacing(8);
 
-    // One "size" slider when the ratio is locked; otherwise independent
-    // width + height sliders.
-    if panel.config.constrain_aspect {
+    // Grid cells are always 16:9. Width and height belong to the
+    // per-client preview windows.
+    if panel.config.display_mode != DisplayMode::Grid {
+        col = col.push(
+            checkbox(panel.config.constrain_aspect)
+                .label("Constrain aspect ratio")
+                .on_toggle(Message::ConstrainAspectToggled),
+        );
+    }
+
+    if panel.config.display_mode == DisplayMode::Grid {
+        col = col.push(slider_field(
+            panel,
+            SliderField::GridColumns,
+            "Columns:",
+            panel.config.grid_columns,
+            "",
+        ));
+        col = col.push(slider_field(
+            panel,
+            SliderField::GridCellWidth,
+            "Cell width:",
+            panel.config.grid_cell_width,
+            "px",
+        ));
+        col = col.push(
+            text(grid_footprint_caption(panel))
+                .size(CAPTION_SIZE)
+                .color(NICOTINE_BLACK),
+        );
+    } else if panel.config.constrain_aspect {
+        // One "size" slider when the ratio is locked; otherwise independent
+        // width + height sliders. Grid cells are always 16:9.
         col = col.push(slider_field(
             panel,
             SliderField::PreviewSize,
@@ -569,6 +604,28 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
     col.into()
 }
 
+/// Footprint of the compact grid at the current slider values. Uses the
+/// cycle-list length when the user has one; otherwise shows what 20
+/// clients would occupy, since that is the case the grid is for.
+fn grid_footprint_caption(panel: &Panel) -> String {
+    let cols = panel.config.grid_columns;
+    let cell = panel.config.grid_cell_width;
+    let n = panel.config.characters.len();
+    if n == 0 {
+        let example = grid_layout(20, cols, cell, GRID_GAP_PX, GRID_OUTER_BORDER_PX);
+        format!(
+            "One cell per logged-in client. 20 clients → {}×{}",
+            example.window_w, example.window_h
+        )
+    } else {
+        let layout = grid_layout(n, cols, cell, GRID_GAP_PX, GRID_OUTER_BORDER_PX);
+        format!(
+            "{n} cycle-list clients → {}×{}",
+            layout.window_w, layout.window_h
+        )
+    }
+}
+
 /// A slider with a typable numeric readout: click the value, type an exact
 /// number, press Enter and the slider snaps to it. The text mirrors the
 /// value except while you're mid-edit. Reused for every slider.
@@ -585,7 +642,7 @@ fn slider_field<'a>(
         .map(String::as_str)
         .unwrap_or("");
     row![
-        text(label).width(Length::Fixed(70.0)),
+        text(label).width(Length::Fixed(88.0)),
         slider(field.range(), value, move |v| field.change_message(v)).step(1u32),
         text_input("", buffer)
             .on_input(move |s| Message::SliderTextChanged(field, s))

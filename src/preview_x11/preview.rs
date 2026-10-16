@@ -535,8 +535,7 @@ impl PreviewManager {
             }
             if let Some(pic) = preview.dps_out_picture {
                 let slot = DPS_SLOT_PX as i16;
-                let tx = preview.width as i16 - slot
-                    + (slot - preview.dps_out_w as i16).max(0);
+                let tx = preview.width as i16 - slot + (slot - preview.dps_out_w as i16).max(0);
                 let ty = (TITLE_STRIP_HEIGHT as i16 - preview.dps_out_h as i16) / 2;
                 conn.render_composite(
                     PictOp::OVER,
