@@ -22,12 +22,12 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
 use crate::preview_common::{
-    fit_contain, grid_layout, grid_thumb_bounds, preview_should_hide, GridCell, GRID_GAP_PX,
-    GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX,
+    fit_contain, grid_layout, grid_thumb_bounds, overlay_label_bands, preview_should_hide,
+    GridCell, GridRect, GRID_GAP_PX, GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX, HALO_PAD,
 };
 
 use super::render::{
-    apply_scale_transform, create_text_pixmap, jetbrains_mono, pick_visual_format, xcolor,
+    apply_scale_transform, create_halo_text_pixmap, jetbrains_mono, pick_visual_format, xcolor,
 };
 use super::{
     opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, CHROME_DARK, NICOTINE_CREAM,
@@ -364,7 +364,7 @@ impl PreviewManager {
         let pic_aux = RenderCreatePictureAux::new().subwindowmode(SubwindowMode::INCLUDE_INFERIORS);
         conn.render_create_picture(src_picture, src_pixmap, src_format, &pic_aux)?;
 
-        let (text_pixmap, text_picture, text_w, text_h) = create_text_pixmap(
+        let (text_pixmap, text_picture, text_w, text_h) = create_halo_text_pixmap(
             conn,
             window,
             title,
@@ -541,7 +541,7 @@ impl PreviewManager {
         } else {
             NICOTINE_CREAM
         };
-        let (pixmap, picture, w, h) = create_text_pixmap(
+        let (pixmap, picture, w, h) = create_halo_text_pixmap(
             &self.conn,
             window,
             label,
@@ -657,7 +657,7 @@ impl PreviewManager {
 
         for src in &cells {
             let cell = src.cell;
-            let bounds = grid_thumb_bounds(cell, layout.cell_inset, layout.scrim);
+            let bounds = grid_thumb_bounds(cell, layout.cell_inset);
             if !src.hide_thumb
                 && src.source_w > 0
                 && src.source_h > 0
@@ -689,25 +689,36 @@ impl PreviewManager {
                 )?;
             }
 
-            let scrim_y = cell.y + cell.h - layout.scrim;
-            let scrim = XRectangle {
-                x: cell.x as i16,
-                y: scrim_y as i16,
-                width: cell.w.max(0) as u16,
-                height: layout.scrim.max(0) as u16,
-            };
-            self.conn
-                .render_fill_rectangles(PictOp::SRC, dst, dark, &[scrim])?;
-
-            let max_w = (cell.w - 4).max(0) as u16;
-            let draw_w = src.text_w.min(max_w);
-            let tx = if src.text_w > max_w {
-                cell.x + 2
+            // Name (or the gold alert) sits on the picture. Hide-active
+            // skips the mirror above and still draws the label on the
+            // dark cell fill. The frame below covers any halo spill.
+            let band = overlay_label_bands(
+                GridRect {
+                    x: cell.x,
+                    y: cell.y,
+                    w: cell.w,
+                    h: cell.h,
+                },
+                layout.cell_inset,
+                layout.scrim,
+                layout.scrim,
+                0,
+            )
+            .bottom;
+            let wider = src.text_w as i32 > band.w;
+            let tx = if wider {
+                band.x - HALO_PAD
             } else {
-                cell.x + (cell.w - draw_w as i32) / 2
+                band.x + (band.w - src.text_w as i32) / 2
             };
-            let ty = scrim_y + (layout.scrim - src.text_h as i32) / 2;
-            if draw_w > 0 && src.text_h > 0 {
+            let ty = band.y + (band.h - src.text_h as i32) / 2;
+            let draw_w = if wider {
+                (band.w + HALO_PAD * 2).max(0) as u16
+            } else {
+                src.text_w
+            };
+            let draw_w = draw_w.min(src.text_w);
+            if draw_w > 0 && src.text_h > 0 && band.h > 0 {
                 self.conn.render_composite(
                     PictOp::OVER,
                     src.text_picture,
@@ -718,9 +729,9 @@ impl PreviewManager {
                     0,
                     0,
                     tx as i16,
-                    ty.max(scrim_y) as i16,
+                    ty as i16,
                     draw_w,
-                    src.text_h.min(layout.scrim.max(0) as u16),
+                    src.text_h,
                 )?;
             }
 

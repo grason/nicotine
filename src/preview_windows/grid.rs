@@ -1,14 +1,13 @@
 //! Compact-grid display mode on Windows: one layered topmost window and
 //! one DWM thumbnail per logged-in client. Cell geometry is the shared
-//! `grid_layout_scaled` helper; this file owns the HWND, the thumbnail
-//! registrations, and the GDI chrome.
+//! `grid_layout_scaled` helper. The frame is GDI; names sit on a
+//! click-through layered popup because DWM paints above GDI.
 
 use anyhow::{Context, Result};
-use std::sync::OnceLock;
 
 use crate::preview_common::{
     fit_contain, grid_cell_at, grid_layout_scaled, grid_thumb_bounds, preview_should_hide,
-    GridLayout, GRID_GAP_PX, GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX,
+    GridLayout, GridRect, GRID_GAP_PX, GRID_OUTER_BORDER_PX,
 };
 use crate::preview_positions::PreviewPositions;
 use crate::windows_manager::id_to_hwnd;
@@ -19,9 +18,8 @@ use windows::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS,
-    DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -33,9 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{
-    apply_window_opacity, create_font, dpi_scale, position_on_screen, positions_locked,
-    register_embedded_fonts, unpack_xy, DragState, Hthumbnail, PreviewManager, CHROME_DARK,
-    GRID_CLASS, MANAGER_PTR, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_RED,
+    apply_window_opacity, dpi_scale, opacity_to_byte, position_on_screen, positions_locked,
+    unpack_xy, DragState, Hthumbnail, PreviewManager, CHROME_DARK, GRID_CLASS, MANAGER_PTR,
+    NICOTINE_GOLD, NICOTINE_RED,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -49,11 +47,13 @@ struct GridThumb {
 
 pub(super) struct OwnedGrid {
     pub(super) hwnd: HWND,
+    overlay: super::overlay::TextOverlay,
     thumbs: Vec<GridThumb>,
 }
 
 impl Drop for OwnedGrid {
     fn drop(&mut self) {
+        self.overlay.destroy();
         unsafe {
             for thumb in self.thumbs.drain(..) {
                 let _ = DwmUnregisterThumbnail(thumb.thumbnail);
@@ -71,6 +71,8 @@ impl Drop for OwnedGrid {
 struct GridWindowState {
     drag: DragState,
     positions: Arc<Mutex<PreviewPositions>>,
+    /// Label-layer HWND so a drag can move it without borrowing the manager.
+    overlay: HWND,
 }
 
 impl PreviewManager {
@@ -156,9 +158,11 @@ impl PreviewManager {
         .context("CreateWindowExW failed for grid window")?;
 
         apply_window_opacity(hwnd, opacity);
+        let overlay = super::overlay::TextOverlay::create(hwnd);
         let state = Box::new(GridWindowState {
             drag: DragState::default(),
             positions: Arc::clone(&self.positions),
+            overlay: overlay.hwnd(),
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -174,6 +178,7 @@ impl PreviewManager {
         }
         self.grid = Some(OwnedGrid {
             hwnd,
+            overlay,
             thumbs: Vec::new(),
         });
         Ok(())
@@ -231,9 +236,9 @@ impl PreviewManager {
     }
 
     /// Size the window from the shared layout and point each thumbnail
-    /// at its cell. The dest is letterboxed inside the content box —
-    /// inside the frame, above the scrim — so a 16:9 cell does not
-    /// stretch the client and DWM cannot paint over the name.
+    /// at its cell. The dest is letterboxed inside the frame. The name
+    /// is a layered popup on top of the mirror, because DWM paints
+    /// above GDI.
     fn layout_grid_thumbs(&mut self, windows: &[crate::window_manager::EveWindow]) {
         let Some(hwnd) = self.grid.as_ref().map(|g| g.hwnd) else {
             return;
@@ -271,7 +276,7 @@ impl PreviewManager {
             let Some(cell) = layout.cells.get(index) else {
                 continue;
             };
-            let bounds = grid_thumb_bounds(*cell, layout.cell_inset, layout.scrim);
+            let bounds = grid_thumb_bounds(*cell, layout.cell_inset);
             let (src_w, src_h) = unsafe {
                 let mut src_rect = RECT::default();
                 if GetWindowRect(id_to_hwnd(thumb.source_id), &mut src_rect).is_ok() {
@@ -353,6 +358,85 @@ impl PreviewManager {
         }
         key
     }
+
+    /// Redraw the label popup when names, alerts, size, or opacity change,
+    /// and re-pin it to the grid window every tick. Owned popups do not
+    /// follow the owner.
+    pub(super) fn refresh_grid_overlay(&mut self) {
+        let Some(hwnd) = self.grid.as_ref().map(|g| g.hwnd) else {
+            return;
+        };
+        let opacity = self.config.preview_opacity;
+        let byte = opacity_to_byte(opacity);
+        let windows = self.state.lock().unwrap().get_ordered_windows();
+        let paint_key = self.grid_paint_key(&windows);
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut rect);
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let key = format!("{paint_key}|{opacity}|{w}|{h}");
+        let fresh = self
+            .grid
+            .as_ref()
+            .is_some_and(|grid| grid.overlay.matches(&key));
+        if fresh {
+            if let Some(grid) = self.grid.as_mut() {
+                grid.overlay.move_to(hwnd);
+                grid.overlay.set_visible(true);
+            }
+            return;
+        }
+
+        let (columns, cell_w, enabled) = {
+            let live = self.live.lock().unwrap();
+            let enabled = self.logs_config.lock().unwrap().enabled;
+            (live.grid_columns, live.grid_cell_width, enabled)
+        };
+        let layout = grid_layout(windows.len(), columns, cell_w);
+        let now = std::time::Instant::now();
+        let labels = {
+            let log = self.log_live.lock().unwrap();
+            let mut labels = Vec::with_capacity(windows.len());
+            for (index, window) in windows.iter().enumerate() {
+                let Some(cell) = layout.cells.get(index) else {
+                    continue;
+                };
+                let is_active = window.id == self.active_id;
+                let alert = if enabled && !is_active {
+                    log.alert_for(&window.title, now).map(|a| a.text.clone())
+                } else {
+                    None
+                };
+                let is_alert = alert.is_some();
+                labels.push(super::overlay::GridLabel {
+                    cell: GridRect {
+                        x: cell.x,
+                        y: cell.y,
+                        w: cell.w,
+                        h: cell.h,
+                    },
+                    text: alert.unwrap_or_else(|| window.title.clone()),
+                    alert: is_alert,
+                });
+            }
+            labels
+        };
+        let pixels = super::overlay::grid_pixels(
+            w,
+            h,
+            &labels,
+            layout.cell_inset,
+            layout.outer_border,
+            layout.scrim,
+            byte,
+        );
+        if let Some(grid) = self.grid.as_mut() {
+            grid.overlay.present(hwnd, &pixels, w, h, key);
+            grid.overlay.set_visible(true);
+        }
+    }
 }
 
 fn grid_layout(count: usize, columns: u32, cell_w: u32) -> GridLayout {
@@ -364,16 +448,6 @@ fn grid_layout(count: usize, columns: u32, cell_w: u32) -> GridLayout {
         GRID_OUTER_BORDER_PX,
         dpi_scale(),
     )
-}
-
-fn grid_font() -> HFONT {
-    static SLOT: OnceLock<isize> = OnceLock::new();
-    let raw = *SLOT.get_or_init(|| {
-        register_embedded_fonts();
-        let height = super::px(-(GRID_NAME_FONT_PX as i32));
-        unsafe { create_font("JetBrains Mono", height).0 as isize }
-    });
-    HFONT(raw as *mut _)
 }
 
 pub(super) unsafe extern "system" fn grid_wnd_proc(
@@ -430,6 +504,7 @@ pub(super) unsafe extern "system" fn grid_wnd_proc(
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
+                    super::overlay::move_overlay_to(state.overlay, new_x, new_y);
                 }
             }
             LRESULT(0)
@@ -529,9 +604,6 @@ unsafe fn paint_grid(hwnd: HWND) {
         dark_brush,
     );
 
-    let _ = SetBkMode(hdc, TRANSPARENT);
-    let font = grid_font();
-    let prev_font = SelectObject(hdc, font.into());
     let now = std::time::Instant::now();
     let log = mgr.log_live.lock().unwrap();
 
@@ -540,11 +612,7 @@ unsafe fn paint_grid(hwnd: HWND) {
             continue;
         };
         let is_active = window.id == mgr.active_id;
-        let alert = if enabled && !is_active {
-            log.alert_for(&window.title, now).map(|a| a.text.clone())
-        } else {
-            None
-        };
+        let alert = enabled && !is_active && log.alert_for(&window.title, now).is_some();
         let taking = enabled && log.taking_damage(&window.title, now);
         let hide = preview_should_hide(hide_active, is_active);
 
@@ -561,42 +629,9 @@ unsafe fn paint_grid(hwnd: HWND) {
             );
         }
 
-        let scrim_y = cell.y + cell.h - layout.scrim;
-        FillRect(
-            hdc,
-            &RECT {
-                left: cell.x,
-                top: scrim_y,
-                right: cell.x + cell.w,
-                bottom: cell.y + cell.h,
-            },
-            dark_brush,
-        );
-
-        let label = alert.clone().unwrap_or_else(|| window.title.clone());
-        let color = if alert.is_some() {
-            NICOTINE_GOLD
-        } else {
-            NICOTINE_CREAM
-        };
-        let _ = SetTextColor(hdc, color);
-        let mut buf: Vec<u16> = label.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: cell.x + 2,
-            top: scrim_y,
-            right: cell.x + cell.w - 2,
-            bottom: cell.y + cell.h,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut buf,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-
         let frame = if is_active || taking {
             Some(red_brush)
-        } else if alert.is_some() {
+        } else if alert {
             Some(gold_brush)
         } else {
             None
@@ -635,7 +670,6 @@ unsafe fn paint_grid(hwnd: HWND) {
         }
     }
 
-    SelectObject(hdc, prev_font);
     let _ = DeleteObject(gold_brush.into());
     let _ = DeleteObject(dark_brush.into());
     let _ = DeleteObject(red_brush.into());

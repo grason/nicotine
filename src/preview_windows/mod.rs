@@ -3,7 +3,7 @@ use crate::cycle_state::CycleState;
 use crate::eve_logs::LogLiveState;
 use crate::preview_common::{
     dps_in_label, dps_out_label, preview_should_hide, snap_position, thumbnail_dest, title_label,
-    DragRect, DragState, ALERT_BANNER_PX, DPS_SLOT_PX, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -25,8 +25,8 @@ use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush,
     DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode,
     SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER,
-    DT_END_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HFONT, LOGFONTW,
-    OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, FONT_QUALITY, FW_NORMAL, HFONT, LOGFONTW, OUT_TT_PRECIS,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -136,6 +136,7 @@ const LIST_CLASS: &str = "NicotineListWnd\0";
 const GRID_CLASS: &str = "NicotineGridWnd\0";
 
 mod grid;
+mod overlay;
 
 // Chrome dimensions below are "reference pixels" at 96 DPI. Every use
 // site wraps them in `px(...)` so they render at the correct physical
@@ -190,17 +191,22 @@ struct PreviewWindowState {
     is_active: bool,
     /// Last title-strip label (`Name` or `Name - Jita`).
     title_label: String,
-    /// Live alert banner text. Presence also shrinks the DWM dest rect.
+    /// Live alert label. Drawn on the text layer; it does not change the
+    /// DWM destination.
     alert_text: Option<String>,
     showing_dps: bool,
     dps_in_label: String,
     dps_out_label: String,
     taking_damage: bool,
+    /// Click-through label window. Copied so the drag handler can move
+    /// it without borrowing the manager. Owned by [`OwnedPreview`].
+    overlay: HWND,
 }
 
 /// One owned preview window. Drop unregisters the DWM thumbnail.
 struct OwnedPreview {
     hwnd: HWND,
+    overlay: overlay::TextOverlay,
     source_id: u32,
     /// Mirror of `PreviewWindowState.is_active` kept here so reconcile
     /// can detect changes without dereferencing the GWLP_USERDATA pointer
@@ -222,6 +228,10 @@ impl Drop for OwnedPreview {
                 let _ = DwmUnregisterThumbnail(state.thumbnail);
                 SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             }
+            // Destroy the owned popup before the owner. Drop of the
+            // field would otherwise DestroyWindow a HWND the owner
+            // teardown already destroyed.
+            self.overlay.destroy();
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -360,6 +370,102 @@ impl PreviewManager {
         let active_id = self.wm.get_active_window().unwrap_or(0);
         self.update_active(active_id);
         self.apply_log_chrome();
+        self.refresh_preview_overlays();
+        self.refresh_grid_overlay();
+    }
+
+    /// Move each text layer onto its preview and redraw when the labels,
+    /// size, or opacity changed. Owned popups do not track the owner, so
+    /// the position is re-applied every tick the same way topmost is.
+    fn refresh_preview_overlays(&mut self) {
+        let opacity = self.config.preview_opacity;
+        let byte = opacity_to_byte(opacity);
+        let names: Vec<String> = self.previews.keys().cloned().collect();
+        for name in names {
+            enum Job {
+                Hide,
+                Show {
+                    hwnd: HWND,
+                    w: i32,
+                    h: i32,
+                    key: String,
+                    pixels: Vec<u8>,
+                    fresh: bool,
+                },
+            }
+            let job = {
+                let Some(preview) = self.previews.get(&name) else {
+                    continue;
+                };
+                if preview.hidden {
+                    Job::Hide
+                } else {
+                    let hwnd = preview.hwnd;
+                    let mut rect = RECT::default();
+                    unsafe {
+                        let _ = GetWindowRect(hwnd, &mut rect);
+                    }
+                    let w = rect.right - rect.left;
+                    let h = rect.bottom - rect.top;
+                    let (key, pixels, fresh) = unsafe {
+                        let ptr =
+                            GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const PreviewWindowState;
+                        if ptr.is_null() {
+                            (String::new(), Vec::new(), true)
+                        } else {
+                            let state = &*ptr;
+                            let alert = state.alert_text.as_deref().unwrap_or("");
+                            let key = format!(
+                                "{}|{}|{}|{}|{}|{w}|{h}|{opacity}",
+                                state.title_label,
+                                state.showing_dps,
+                                state.dps_in_label,
+                                state.dps_out_label,
+                                alert
+                            );
+                            let fresh = preview.overlay.matches(&key);
+                            let pixels = if fresh {
+                                Vec::new()
+                            } else {
+                                overlay::preview_pixels(state, w, h, byte)
+                            };
+                            (key, pixels, fresh)
+                        }
+                    };
+                    Job::Show {
+                        hwnd,
+                        w,
+                        h,
+                        key,
+                        pixels,
+                        fresh,
+                    }
+                }
+            };
+            let Some(preview) = self.previews.get_mut(&name) else {
+                continue;
+            };
+            match job {
+                Job::Hide => preview.overlay.set_visible(false),
+                Job::Show {
+                    fresh: true, hwnd, ..
+                } => {
+                    preview.overlay.move_to(hwnd);
+                    preview.overlay.set_visible(true);
+                }
+                Job::Show {
+                    hwnd,
+                    w,
+                    h,
+                    key,
+                    pixels,
+                    ..
+                } => {
+                    preview.overlay.present(hwnd, &pixels, w, h, key);
+                    preview.overlay.set_visible(true);
+                }
+            }
+        }
     }
 
     fn reconcile_previews(&mut self) {
@@ -571,8 +677,7 @@ impl PreviewManager {
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
-                    let banner = (*ptr).alert_text.is_some();
-                    update_thumbnail_rect((*ptr).thumbnail, w, h, banner);
+                    update_thumbnail_rect((*ptr).thumbnail, w, h);
                 }
                 // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
@@ -623,6 +728,7 @@ impl PreviewManager {
             unsafe {
                 let _ = ShowWindow(preview.hwnd, cmd);
             }
+            preview.overlay.set_visible(!want_hidden);
         }
     }
 
@@ -671,7 +777,6 @@ impl PreviewManager {
                 if ptr.is_null() {
                     continue;
                 }
-                let banner_was = (*ptr).alert_text.is_some();
                 let changed = (*ptr).title_label != label
                     || (*ptr).alert_text != alert
                     || (*ptr).showing_dps != want_dps
@@ -684,17 +789,6 @@ impl PreviewManager {
                 (*ptr).dps_in_label = in_l;
                 (*ptr).dps_out_label = out_l;
                 (*ptr).taking_damage = taking;
-                let banner_now = (*ptr).alert_text.is_some();
-                if banner_was != banner_now {
-                    let mut rect = RECT::default();
-                    let _ = GetWindowRect(preview.hwnd, &mut rect);
-                    update_thumbnail_rect(
-                        (*ptr).thumbnail,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                        banner_now,
-                    );
-                }
                 if changed {
                     let _ = InvalidateRect(Some(preview.hwnd), None, true);
                 }
@@ -853,6 +947,9 @@ impl PreviewManager {
                     let _ = InvalidateRect(Some(grid.hwnd), None, false);
                 }
             }
+            // The grid label is not GDI. Refresh it now so a focus change
+            // does not wait for the next reconcile tick to drop the alert.
+            self.refresh_grid_overlay();
         }
     }
 
@@ -905,13 +1002,15 @@ impl PreviewManager {
         // never flashes fully opaque.
         apply_window_opacity(hwnd, self.config.preview_opacity);
 
-        // Register a DWM thumbnail mirroring the EVE source HWND into our
-        // window's client area below the title strip.
+        // Register a DWM thumbnail mirroring the EVE source HWND into the
+        // interior of the frame. Labels live on an owned popup because
+        // DWM paints above anything this window draws.
         let thumbnail: Hthumbnail = unsafe {
             DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
                 .context("DwmRegisterThumbnail failed")?
         };
-        update_thumbnail_rect(thumbnail, width, height, false);
+        update_thumbnail_rect(thumbnail, width, height);
+        let text = overlay::TextOverlay::create(hwnd);
 
         let per_window = Box::new(PreviewWindowState {
             source_id: window.id,
@@ -927,6 +1026,7 @@ impl PreviewManager {
             dps_in_label: String::new(),
             dps_out_label: String::new(),
             taking_damage: false,
+            overlay: text.hwnd(),
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
@@ -950,6 +1050,7 @@ impl PreviewManager {
             window.title.clone(),
             OwnedPreview {
                 hwnd,
+                overlay: text,
                 source_id: window.id,
                 is_active: false,
                 // Created visible (WS_VISIBLE); the reconcile pass right
@@ -968,23 +1069,20 @@ impl PreviewManager {
     }
 }
 
-/// Recompute the DWM thumbnail destination rect. The thumbnail occupies
-/// everything below the title strip, inset by BORDER_WIDTH on the sides
-/// and bottom so we have margin to paint the active-client outline. We
-/// mirror the whole source window (including any title bar/border) — EVE's
-/// client area definition reportedly hides the actual game render surface,
-/// so SOURCECLIENTAREAONLY gives a blank preview.
-fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, banner: bool) {
+/// Recompute the DWM thumbnail destination rect. The mirror fills the
+/// interior inside the frame. Labels are a separate layered popup:
+/// DWM paints above GDI, so text in this window would be covered.
+/// We mirror the whole source window (including any title bar/border) —
+/// EVE's client area definition reportedly hides the actual game render
+/// surface, so SOURCECLIENTAREAONLY gives a blank preview.
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
     let border = px(BORDER_WIDTH);
-    let title = px(TITLE_HEIGHT);
-    let banner_h = if banner { px(ALERT_BANNER_PX) } else { 0 };
-    let (left, top, right, bottom) = thumbnail_dest(width, height, title, border, banner_h);
+    let (left, top, right, bottom) = thumbnail_dest(width, height, border);
     // The thumbnail is always pushed fully opaque (255). User-facing
     // translucency is applied to the host window via apply_window_opacity;
     // scaling the thumbnail opacity instead would blend the mirror against
     // the opaque chrome background (CHROME_DARK), darkening toward black
-    // rather than revealing the desktop behind. The dest rect stops above
-    // the GDI alert banner so DWM cannot paint over it.
+    // rather than revealing the desktop behind.
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
         rcDestination: RECT {
@@ -1113,6 +1211,7 @@ unsafe extern "system" fn preview_wnd_proc(
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
+                    overlay::move_overlay_to(state.overlay, new_x, new_y);
                 }
             }
             LRESULT(0)
@@ -1167,14 +1266,14 @@ fn register_embedded_fonts() {
 /// Build a LOGFONTW + create an HFONT for `face` at the given negative
 /// lfHeight (pixels). Caller owns the returned HFONT; in practice we stash
 /// them in OnceLocks and never delete them — they live for the process.
-unsafe fn create_font(face: &str, height: i32) -> HFONT {
+unsafe fn create_font(face: &str, height: i32, quality: FONT_QUALITY) -> HFONT {
     let mut logfont = LOGFONTW {
         lfHeight: height,
         lfWeight: FW_NORMAL.0 as i32,
         lfCharSet: DEFAULT_CHARSET,
         lfOutPrecision: OUT_TT_PRECIS,
         lfClipPrecision: CLIP_DEFAULT_PRECIS,
-        lfQuality: CLEARTYPE_QUALITY,
+        lfQuality: quality,
         ..Default::default()
     };
     let face_u16: Vec<u16> = face.encode_utf16().collect();
@@ -1191,7 +1290,7 @@ fn nicotine_body_font() -> HFONT {
     static SLOT: OnceLock<isize> = OnceLock::new();
     let raw = *SLOT.get_or_init(|| {
         register_embedded_fonts();
-        unsafe { create_font("JetBrains Mono", px(-14)).0 as isize }
+        unsafe { create_font("JetBrains Mono", px(-14), CLEARTYPE_QUALITY).0 as isize }
     });
     HFONT(raw as *mut _)
 }
@@ -1202,17 +1301,14 @@ fn nicotine_logo_font() -> HFONT {
     static SLOT: OnceLock<isize> = OnceLock::new();
     let raw = *SLOT.get_or_init(|| {
         register_embedded_fonts();
-        unsafe { create_font("Marlboro", px(-20)).0 as isize }
+        unsafe { create_font("Marlboro", px(-20), CLEARTYPE_QUALITY).0 as isize }
     });
     HFONT(raw as *mut _)
 }
 
-/// Paint the preview's chrome: a title strip at the top with the
-/// character name (and solar system when known), plus a left/right/bottom
-/// border around the thumbnail area. Border is Nicotine red when this
-/// client is the system foreground window, gold when an inactive client
-/// has a live alert, otherwise dark. A cream alert banner sits above
-/// the bottom border — outside the DWM dest rect.
+/// Paint the preview frame. Red when focused or taking damage, gold
+/// when an inactive client has a live alert, dark otherwise. The name,
+/// DPS, and alert are on the text layer — DWM covers GDI in the interior.
 unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
@@ -1231,124 +1327,52 @@ unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
         CHROME_DARK
     };
     let chrome_brush = CreateSolidBrush(chrome_color);
-    let title_h = px(TITLE_HEIGHT);
+    let dark_brush = CreateSolidBrush(CHROME_DARK);
     let border_w = px(BORDER_WIDTH);
-    let banner_h = if state.alert_text.is_some() {
-        px(ALERT_BANNER_PX)
-    } else {
-        0
-    };
 
-    // Top strip (full-width title bar). DPS, when live, sits in this
-    // same 24px row so the thumbnail dest never moves.
-    let title_strip = RECT {
-        left: 0,
-        top: 0,
-        right: width,
-        bottom: title_h,
-    };
-    FillRect(hdc, &title_strip, chrome_brush);
-
-    // Left, right, and bottom borders around the thumbnail area.
-    let left_border = RECT {
-        left: 0,
-        top: title_h,
-        right: border_w,
-        bottom: height,
-    };
-    let right_border = RECT {
-        left: width - border_w,
-        top: title_h,
-        right: width,
-        bottom: height,
-    };
-    let bottom_border = RECT {
-        left: 0,
-        top: height - border_w,
-        right: width,
-        bottom: height,
-    };
-    FillRect(hdc, &left_border, chrome_brush);
-    FillRect(hdc, &right_border, chrome_brush);
-    FillRect(hdc, &bottom_border, chrome_brush);
+    // Dark interior. DWM paints the mirror on top of it.
+    FillRect(
+        hdc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        dark_brush,
+    );
+    let borders = [
+        RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: border_w,
+        },
+        RECT {
+            left: 0,
+            top: height - border_w,
+            right: width,
+            bottom: height,
+        },
+        RECT {
+            left: 0,
+            top: 0,
+            right: border_w,
+            bottom: height,
+        },
+        RECT {
+            left: width - border_w,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+    ];
+    for border in &borders {
+        FillRect(hdc, border, chrome_brush);
+    }
 
     let _ = DeleteObject(chrome_brush.into());
-
-    // White centered character name (plus system) in the full title
-    // strip. Same position with or without DPS so taking damage does
-    // not shift the name.
-    let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
-    let body_font = nicotine_body_font();
-    let prev_font = SelectObject(hdc, body_font.into());
-    let mut text: Vec<u16> = state.title_label.encode_utf16().collect();
-    let mut text_rect = title_strip;
-    let _ = DrawTextW(
-        hdc,
-        &mut text,
-        &mut text_rect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-    );
-
-    if state.showing_dps {
-        let dps_side = px(DPS_SLOT_PX);
-        let mut in_buf: Vec<u16> = state.dps_in_label.encode_utf16().collect();
-        let mut in_rect = RECT {
-            left: title_strip.left + px(6),
-            top: title_strip.top,
-            right: title_strip.left + dps_side,
-            bottom: title_strip.bottom,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut in_buf,
-            &mut in_rect,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-        );
-        let mut out_buf: Vec<u16> = state.dps_out_label.encode_utf16().collect();
-        let mut out_rect = RECT {
-            left: title_strip.right - dps_side,
-            top: title_strip.top,
-            right: title_strip.right - px(6),
-            bottom: title_strip.bottom,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut out_buf,
-            &mut out_rect,
-            DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS,
-        );
-    }
-
-    if let Some(alert) = &state.alert_text {
-        let banner_top = height - border_w - banner_h;
-        let cream_brush = CreateSolidBrush(NICOTINE_CREAM);
-        let banner_rect = RECT {
-            left: border_w,
-            top: banner_top,
-            right: width - border_w,
-            bottom: height - border_w,
-        };
-        FillRect(hdc, &banner_rect, cream_brush);
-        let _ = DeleteObject(cream_brush.into());
-        let _ = SetTextColor(hdc, NICOTINE_RED);
-        let mut alert_buf: Vec<u16> = alert.encode_utf16().collect();
-        let mut alert_rect = RECT {
-            left: banner_rect.left + px(6),
-            top: banner_rect.top,
-            right: banner_rect.right - px(4),
-            bottom: banner_rect.bottom,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut alert_buf,
-            &mut alert_rect,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-        );
-    }
-
-    SelectObject(hdc, prev_font);
-
+    let _ = DeleteObject(dark_brush.into());
     let _ = EndPaint(hwnd, &ps);
 }
 
@@ -1674,13 +1698,14 @@ fn register_classes(module: HMODULE) -> Result<()> {
             hIconSm: HICON::default(),
         };
         let _ = RegisterClassExW(&grid_wc);
+        overlay::register_class(module, cursor);
     }
     Ok(())
 }
 
 /// Spawn the preview-window manager thread. Runs forever (until the
 /// daemon process exits). Each EVE client gets a borderless top-most
-/// preview window with a 24px title strip and a DWM thumbnail mirror.
+/// preview window with a DWM thumbnail and labels drawn on the picture.
 pub fn spawn(
     config: Config,
     wm: Arc<dyn WindowManager>,

@@ -43,9 +43,10 @@ pub const DRAG_THRESHOLD_PX: i32 = 4;
 /// docked previews. DPI-scaled on Windows; raw on Linux.
 pub const SNAP_THRESHOLD_PX: i32 = 12;
 
-/// Height of the alert banner painted above the bottom chrome border
-/// while an inactive client has a live log alert. Reference pixels
-/// (96 DPI); Windows scales via `px()`, Linux uses the value raw.
+/// Height of the alert label drawn on the bottom of a preview.
+/// Reference pixels (96 DPI); Windows scales via `px()`, Linux uses
+/// the value raw. The label sits on the thumbnail; it does not reserve
+/// a strip or change the window height.
 pub const ALERT_BANNER_PX: i32 = 18;
 
 /// Title-strip pixels reserved for one DPS figure (`↓10k+` / `↑10k+`).
@@ -91,21 +92,137 @@ pub fn title_label(character: &str, system: Option<&str>) -> String {
 }
 
 /// Thumbnail destination inside a preview window, in window coordinates
-/// (right/bottom exclusive). `banner` is 0 or `ALERT_BANNER_PX` (already
-/// DPI-scaled by the caller). Used by both backends so dest-rect math
-/// stays in one place — DWM must not cover the GDI banner.
-pub fn thumbnail_dest(
+/// (right/bottom exclusive). The mirror fills the interior inside
+/// `border` on every side. Labels are drawn on top of this rect, so an
+/// alert does not change the destination.
+pub fn thumbnail_dest(width: i32, height: i32, border: i32) -> (i32, i32, i32, i32) {
+    let border = border.max(0);
+    let left = border;
+    let top = border;
+    let right = (width - border).max(left + 1);
+    let bottom = (height - border).max(top + 1);
+    (left, top, right, bottom)
+}
+
+/// 1px black halo baked into label pixmaps so cream, white, and red
+/// stay readable on a bright thumbnail. Linux window opacity and the
+/// Windows layered bitmap scale the result; this function does not.
+pub const HALO_PAD: i32 = 1;
+
+/// Where a preview's name, DPS figures, and alert sit inside `outer`.
+/// `top` is the name band. DPS slots share that band's vertical span.
+/// `bottom` is the alert band (and, on the grid, the name band).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayBands {
+    pub top: GridRect,
+    pub dps_in: GridRect,
+    pub dps_out: GridRect,
+    pub bottom: GridRect,
+}
+
+/// Label rectangles inside a window or cell, inset by `frame`. Sizes are
+/// already in device pixels. A band taller than the interior is clipped
+/// so the name and the alert never overlap.
+pub fn overlay_label_bands(
+    outer: GridRect,
+    frame: i32,
+    name_h: i32,
+    alert_h: i32,
+    dps_slot: i32,
+) -> OverlayBands {
+    let frame = frame.max(0);
+    let name_h = name_h.max(0);
+    let alert_h = alert_h.max(0);
+    let dps_slot = dps_slot.max(0);
+    let inner_w = (outer.w - frame * 2).max(0);
+    let inner_h = (outer.h - frame * 2).max(0);
+    let top_h = name_h.min(inner_h);
+    let bottom_h = alert_h.min(inner_h.saturating_sub(top_h));
+    let top = GridRect {
+        x: outer.x + frame,
+        y: outer.y + frame,
+        w: inner_w,
+        h: top_h,
+    };
+    let slot = dps_slot.min(inner_w);
+    OverlayBands {
+        top,
+        dps_in: GridRect {
+            x: top.x,
+            y: top.y,
+            w: slot,
+            h: top_h,
+        },
+        dps_out: GridRect {
+            x: top.x + inner_w - slot,
+            y: top.y,
+            w: slot,
+            h: top_h,
+        },
+        bottom: GridRect {
+            x: outer.x + frame,
+            y: outer.y + outer.h - frame - bottom_h,
+            w: inner_w,
+            h: bottom_h,
+        },
+    }
+}
+
+/// Premultiplied BGRA (little-endian) for a coverage mask, with a black
+/// halo `pad` pixels wide. The halo is the Chebyshev dilation of
+/// `coverage`, and the glyph is composited over it, so partial coverage
+/// stays the glyph color while empty neighbors become opaque black.
+/// The buffer is `(width + 2*pad)` by `(height + 2*pad)`. `pad == 0`
+/// is a straight premultiply — the glyph is not outlined.
+pub fn cover_with_halo(
+    coverage: &[u8],
     width: i32,
     height: i32,
-    title: i32,
-    border: i32,
-    banner: i32,
-) -> (i32, i32, i32, i32) {
-    let left = border;
-    let top = title;
-    let right = (width - border).max(left + 1);
-    let bottom = (height - border - banner).max(top + 1);
-    (left, top, right, bottom)
+    color: (u8, u8, u8),
+    pad: i32,
+) -> Vec<u8> {
+    let width = width.max(0);
+    let height = height.max(0);
+    let pad = pad.max(0);
+    let out_w = width + pad * 2;
+    let out_h = height + pad * 2;
+    if out_w <= 0 || out_h <= 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+    let sample = |x: i32, y: i32| -> u8 {
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return 0;
+        }
+        let idx = (y as usize) * (width as usize) + (x as usize);
+        coverage.get(idx).copied().unwrap_or(0)
+    };
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let sx = ox - pad;
+            let sy = oy - pad;
+            let g = sample(sx, sy) as u32;
+            // Neighbors only. Including the pixel itself would darken
+            // antialiased edges even when pad is 0.
+            let mut halo = 0u8;
+            for dy in -pad..=pad {
+                for dx in -pad..=pad {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    halo = halo.max(sample(sx + dx, sy + dy));
+                }
+            }
+            let halo = halo as u32;
+            let a = g + halo * (255 - g) / 255;
+            let idx = ((oy * out_w + ox) as usize) * 4;
+            out[idx] = (color.2 as u32 * g / 255) as u8;
+            out[idx + 1] = (color.1 as u32 * g / 255) as u8;
+            out[idx + 2] = (color.0 as u32 * g / 255) as u8;
+            out[idx + 3] = a as u8;
+        }
+    }
+    out
 }
 
 /// Adjust a proposed (x, y) so the dragged window's edges snap to
@@ -202,17 +319,18 @@ pub const GRID_CELL_WIDTH_DEFAULT: u32 = 160;
 pub const GRID_GAP_PX: i32 = 1;
 pub const GRID_OUTER_BORDER_PX: i32 = 2;
 
-/// Name scrim at the bottom of a cell, and the state border drawn inside
-/// the cell. The thumbnail dest stays above the scrim and inside the
-/// border so it never covers the name or the red/gold frame.
+/// Height of the name (or alert label) drawn across the bottom of a
+/// cell. The thumbnail fills the cell; this only places the text.
 pub const GRID_SCRIM_PX: i32 = 16;
+/// State border drawn inside a cell. The thumbnail stays inside it so
+/// the red/gold frame is not covered by the mirror.
 pub const GRID_CELL_BORDER_PX: i32 = 2;
 
-/// Character-name size on the scrim. Reference pixels.
+/// Character-name size on a grid cell. Reference pixels.
 pub const GRID_NAME_FONT_PX: f32 = 12.0;
 
 /// One cell in window coordinates. `x`/`y` are the top-left; `w`/`h`
-/// are the full cell, including the scrim.
+/// are the full cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridCell {
     pub index: usize,
@@ -338,15 +456,13 @@ fn scale_px(n: i32, scale: f32) -> i32 {
 }
 
 /// Rectangle the thumbnail is allowed to occupy: inside the state
-/// border, and above the name scrim. Painting the thumbnail here keeps
-/// it off the name and off the red/gold frame.
-pub fn grid_thumb_bounds(cell: GridCell, inset: i32, scrim: i32) -> GridRect {
+/// border on every side. The name is drawn on top of this box.
+pub fn grid_thumb_bounds(cell: GridCell, inset: i32) -> GridRect {
     let inset = inset.max(0);
-    let scrim = scrim.max(0);
     let x = cell.x + inset;
     let y = cell.y + inset;
     let w = (cell.w - inset * 2).max(1);
-    let h = (cell.h - scrim - inset).max(1);
+    let h = (cell.h - inset * 2).max(1);
     GridRect { x, y, w, h }
 }
 
@@ -418,26 +534,107 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_dest_no_banner_matches_chrome() {
-        // 320×180 preview, 24px title, 3px border — same numbers the
-        // Windows manager uses at 96 DPI.
-        let (l, t, r, b) = thumbnail_dest(320, 180, 24, 3, 0);
-        assert_eq!((l, t, r, b), (3, 24, 317, 177));
+    fn thumbnail_dest_is_the_interior_inside_the_frame() {
+        // 320×180 preview, 3px border — same numbers the Windows manager
+        // uses at 96 DPI. An alert does not change the rect.
+        let (l, t, r, b) = thumbnail_dest(320, 180, 3);
+        assert_eq!((l, t, r, b), (3, 3, 317, 177));
     }
 
     #[test]
-    fn thumbnail_dest_banner_shrinks_bottom() {
-        let (l, t, r, b) = thumbnail_dest(320, 180, 24, 3, 18);
-        assert_eq!((l, t, r, b), (3, 24, 317, 159));
-        // Banner lives between dest.bottom and the bottom border.
-        assert_eq!(180 - 3 - 18, 159);
+    fn overlay_label_bands_preview_window() {
+        let bands = overlay_label_bands(
+            GridRect {
+                x: 0,
+                y: 0,
+                w: 320,
+                h: 180,
+            },
+            3,
+            24,
+            18,
+            48,
+        );
+        assert_eq!(
+            bands.top,
+            GridRect {
+                x: 3,
+                y: 3,
+                w: 314,
+                h: 24
+            }
+        );
+        assert_eq!(
+            bands.dps_in,
+            GridRect {
+                x: 3,
+                y: 3,
+                w: 48,
+                h: 24
+            }
+        );
+        assert_eq!(
+            bands.dps_out,
+            GridRect {
+                x: 269,
+                y: 3,
+                w: 48,
+                h: 24
+            }
+        );
+        assert_eq!(
+            bands.bottom,
+            GridRect {
+                x: 3,
+                y: 159,
+                w: 314,
+                h: 18
+            }
+        );
     }
 
     #[test]
-    fn thumbnail_dest_title_is_fixed_24_with_banner() {
-        // DPS lives in the 24px title, so dest.top stays 24.
-        let (l, t, r, b) = thumbnail_dest(320, 180, 24, 3, 18);
-        assert_eq!((l, t, r, b), (3, 24, 317, 159));
+    fn overlay_label_bands_grid_cell_bottom() {
+        let bands = overlay_label_bands(
+            GridRect {
+                x: 2,
+                y: 2,
+                w: 160,
+                h: 90,
+            },
+            2,
+            16,
+            16,
+            0,
+        );
+        assert_eq!(
+            bands.bottom,
+            GridRect {
+                x: 4,
+                y: 74,
+                w: 156,
+                h: 16
+            }
+        );
+    }
+
+    #[test]
+    fn cover_with_halo_paints_black_ring_and_premultiplies() {
+        let px = cover_with_halo(&[255], 1, 1, (252, 250, 242), 1);
+        assert_eq!(px.len(), 9 * 4);
+        assert_eq!(&px[4 * 4..5 * 4], &[242, 250, 252, 255]);
+        for i in 0..9 {
+            if i == 4 {
+                continue;
+            }
+            assert_eq!(&px[i * 4..i * 4 + 4], &[0, 0, 0, 255], "neighbor {i}");
+        }
+    }
+
+    #[test]
+    fn cover_with_halo_pad_zero_is_premultiply() {
+        let px = cover_with_halo(&[128], 1, 1, (255, 0, 0), 0);
+        assert_eq!(px, vec![0, 0, 128, 128]);
     }
 
     #[test]
@@ -784,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_thumb_bounds_stay_above_the_scrim() {
+    fn grid_thumb_bounds_fill_inside_the_frame() {
         let cell = GridCell {
             index: 0,
             x: 2,
@@ -792,14 +989,14 @@ mod tests {
             w: 160,
             h: 90,
         };
-        let bounds = grid_thumb_bounds(cell, 2, 16);
+        let bounds = grid_thumb_bounds(cell, 2);
         assert_eq!(
             bounds,
             GridRect {
                 x: 4,
                 y: 4,
                 w: 156,
-                h: 72
+                h: 86
             }
         );
     }

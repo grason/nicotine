@@ -48,18 +48,9 @@ fn fixed_truncates_toward_zero_not_rounds() {
 
 #[test]
 fn thumbnail_size_normal_dimensions() {
-    // Standard preview: subtract border on both sides for width
-    // (3 * 2 = 6); subtract title strip + bottom border for height
-    // (24 + 3 = 27).
-    assert_eq!(thumbnail_size(480, 270), (474, 243));
-}
-
-#[test]
-fn thumbnail_size_with_banner_shrinks_height() {
-    let (w, h) = thumbnail_size_with_banner(480, 270, true);
-    let (w0, h0) = thumbnail_size(480, 270);
-    assert_eq!(w, w0);
-    assert_eq!(h, h0 - ALERT_BANNER_HEIGHT);
+    // Standard preview: inset the 3px frame on every side.
+    // 480 - 6 = 474, 270 - 6 = 264. An alert does not change this.
+    assert_eq!(thumbnail_size(480, 270), (474, 264));
 }
 
 #[test]
@@ -84,28 +75,23 @@ fn thumbnail_size_floors_at_one_not_zero() {
     // removing it.
     assert_eq!(thumbnail_size(0, 0), (1, 1));
     assert_eq!(thumbnail_size(1, 1), (1, 1));
-    assert_eq!(
-        thumbnail_size(BORDER_WIDTH * 2, TITLE_STRIP_HEIGHT + BORDER_WIDTH),
-        (1, 1)
-    );
+    assert_eq!(thumbnail_size(BORDER_WIDTH * 2, BORDER_WIDTH * 2), (1, 1));
 }
 
 #[test]
 fn thumbnail_size_saturating_sub_doesnt_underflow() {
     // Without saturating_sub this would underflow on u16 and
     // either panic (debug) or wrap to ~65535 (release).
-    let (w, h) = thumbnail_size(2, 20);
-    assert_eq!((w, h), (1, 1));
+    assert_eq!(thumbnail_size(2, 2), (1, 1));
 }
 
 #[test]
 fn thumbnail_size_one_pixel_above_chrome() {
-    // Just past the chrome floor — the first size where saturation
-    // doesn't clip the result.
-    let min_w = BORDER_WIDTH * 2 + 1;
-    let min_h = TITLE_STRIP_HEIGHT + BORDER_WIDTH + 1;
-    assert_eq!(thumbnail_size(min_w, min_h), (1, 1));
-    assert_eq!(thumbnail_size(min_w + 1, min_h + 1), (2, 2));
+    // Just past the frame — the first size where saturation doesn't
+    // clip the result.
+    let min = BORDER_WIDTH * 2 + 1;
+    assert_eq!(thumbnail_size(min, min), (1, 1));
+    assert_eq!(thumbnail_size(min + 1, min + 1), (2, 2));
 }
 
 // --- pick_visual_format -----------------------------------------

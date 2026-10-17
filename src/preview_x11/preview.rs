@@ -21,17 +21,46 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-use crate::preview_common::{thumbnail_dest, DPS_SLOT_PX};
+use crate::preview_common::{overlay_label_bands, thumbnail_dest, GridRect, DPS_SLOT_PX, HALO_PAD};
 
 use super::render::{
-    apply_scale_transform, create_text_pixmap, jetbrains_mono, pick_visual_format, thumbnail_size,
-    thumbnail_size_with_banner, xcolor,
+    apply_scale_transform, create_halo_text_pixmap, jetbrains_mono, pick_visual_format,
+    thumbnail_size, xcolor,
 };
 use super::{
     opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, ALERT_BANNER_HEIGHT,
     BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_RED, PREVIEW_HEIGHT,
     PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
 };
+
+fn composite_over(
+    conn: &RustConnection,
+    src: u32,
+    dst: u32,
+    x: i32,
+    y: i32,
+    w: u16,
+    h: u16,
+) -> Result<()> {
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    conn.render_composite(
+        PictOp::OVER,
+        src,
+        x11rb::NONE,
+        dst,
+        0,
+        0,
+        0,
+        0,
+        x as i16,
+        y as i16,
+        w,
+        h,
+    )?;
+    Ok(())
+}
 
 /// Owns one preview window's resources. Drop releases everything in
 /// reverse construction order. Best-effort — if the X11 connection has
@@ -71,8 +100,8 @@ pub(super) struct OwnedPreview {
     /// Last title-strip label we rasterized (`Name` or `Name - Jita`).
     /// Rebuilt when the solar system changes.
     pub(super) title_label: String,
-    /// Live alert banner text, if any. Presence also shrinks the
-    /// thumbnail dest so the cream strip isn't covered by the composite.
+    /// Live alert label, if any. Drawn on the thumbnail; it does not
+    /// change the destination rect.
     pub(super) alert_text: Option<String>,
     pub(super) alert_pixmap: Option<u32>,
     pub(super) alert_picture: Option<u32>,
@@ -343,7 +372,7 @@ impl PreviewManager {
         // PictOp::OVER call with the title picture as the source — no
         // separate mask, no solid-fill picture, nothing for the X server
         // to interpret differently across vendors.
-        let (title_pixmap, title_picture, title_text_w, title_text_h) = create_text_pixmap(
+        let (title_pixmap, title_picture, title_text_w, title_text_h) = create_halo_text_pixmap(
             conn,
             our_window,
             title,
@@ -442,14 +471,47 @@ impl PreviewManager {
         Ok(())
     }
 
-    /// Paint chrome on a preview: fill the title strip + borders with
-    /// the chrome color (Nicotine red when source is the foreground
-    /// window, gold when an inactive client has a live alert, dark
-    /// otherwise), then composite the pre-rasterized title text. A
-    /// cream alert banner sits above the bottom border when `alert_text`
-    /// is set.
-    pub(super) fn paint_chrome(&self, preview: &OwnedPreview) -> Result<()> {
+    /// Assemble one preview into its offscreen pixmap: dark interior,
+    /// the live thumbnail, labels on top of the picture, then the frame.
+    /// The frame is last so a label halo cannot eat the 3px border.
+    /// Red when focused or taking damage, gold for an inactive alert,
+    /// dark otherwise.
+    fn paint_preview_frame(&self, preview: &OwnedPreview) -> Result<()> {
         let conn = &self.conn;
+        let dst = preview.render_picture;
+        let dark = xcolor(CHROME_DARK, 0xffff);
+        let full = XRectangle {
+            x: 0,
+            y: 0,
+            width: preview.width,
+            height: preview.height,
+        };
+        conn.render_fill_rectangles(PictOp::SRC, dst, dark, &[full])?;
+
+        let (left, top, right, bottom) = thumbnail_dest(
+            preview.width as i32,
+            preview.height as i32,
+            BORDER_WIDTH as i32,
+        );
+        let dest_w = (right - left).max(1) as u16;
+        let dest_h = (bottom - top).max(1) as u16;
+        conn.render_composite(
+            PictOp::SRC,
+            preview.src_picture,
+            x11rb::NONE,
+            dst,
+            0,
+            0,
+            0,
+            0,
+            left as i16,
+            top as i16,
+            dest_w,
+            dest_h,
+        )?;
+
+        self.paint_preview_labels(preview)?;
+
         let has_alert = preview.alert_text.is_some() && !preview.is_active;
         let chrome_color = xcolor(
             if preview.is_active || preview.taking_damage {
@@ -461,95 +523,92 @@ impl PreviewManager {
             },
             0xffff,
         );
-
-        let title_h = TITLE_STRIP_HEIGHT;
-        // Title strip + 3 borders around the thumbnail area. One round-trip.
+        let border = BORDER_WIDTH;
         let rects = [
             XRectangle {
                 x: 0,
                 y: 0,
                 width: preview.width,
-                height: title_h,
+                height: border,
             },
             XRectangle {
                 x: 0,
-                y: title_h as i16,
-                width: BORDER_WIDTH,
-                height: preview.height - title_h,
-            },
-            XRectangle {
-                x: (preview.width - BORDER_WIDTH) as i16,
-                y: title_h as i16,
-                width: BORDER_WIDTH,
-                height: preview.height - title_h,
-            },
-            XRectangle {
-                x: 0,
-                y: (preview.height - BORDER_WIDTH) as i16,
+                y: preview.height.saturating_sub(border) as i16,
                 width: preview.width,
-                height: BORDER_WIDTH,
+                height: border,
+            },
+            XRectangle {
+                x: 0,
+                y: 0,
+                width: border,
+                height: preview.height,
+            },
+            XRectangle {
+                x: preview.width.saturating_sub(border) as i16,
+                y: 0,
+                width: border,
+                height: preview.height,
             },
         ];
-        conn.render_fill_rectangles(PictOp::SRC, preview.render_picture, chrome_color, &rects)?;
+        conn.render_fill_rectangles(PictOp::SRC, dst, chrome_color, &rects)?;
+        Ok(())
+    }
 
-        // Composite the pre-rasterized text on top. Source is ARGB32
-        // (cream RGB premultiplied with the rasterized alpha); PictOp
-        // OVER blends it onto the chrome strip we just filled.
-        // Name is centered in the full title whether DPS is showing or
-        // not, so taking damage does not shift it.
-        let baseline_y = (TITLE_STRIP_HEIGHT as i16 - preview.title_text_h as i16) / 2;
-        let baseline_y = baseline_y.max(0);
-        let dest_x = (preview.width as i16 - preview.title_text_w as i16) / 2;
-        conn.render_composite(
-            PictOp::OVER,
+    /// Name and DPS across the top of the picture, alert across the
+    /// bottom. Pixmaps include [`HALO_PAD`], so centering the returned
+    /// size keeps glyphs centered and left/right alignment subtracts the pad.
+    fn paint_preview_labels(&self, preview: &OwnedPreview) -> Result<()> {
+        let bands = overlay_label_bands(
+            GridRect {
+                x: 0,
+                y: 0,
+                w: preview.width as i32,
+                h: preview.height as i32,
+            },
+            BORDER_WIDTH as i32,
+            TITLE_STRIP_HEIGHT as i32,
+            ALERT_BANNER_HEIGHT as i32,
+            DPS_SLOT_PX,
+        );
+        let dst = preview.render_picture;
+        let name_x = bands.top.x + (bands.top.w - preview.title_text_w as i32) / 2;
+        let name_y = bands.top.y + (bands.top.h - preview.title_text_h as i32) / 2;
+        composite_over(
+            &self.conn,
             preview.title_picture,
-            x11rb::NONE,
-            preview.render_picture,
-            0,
-            0,
-            0,
-            0,
-            dest_x.max(0),
-            baseline_y,
+            dst,
+            name_x,
+            name_y,
             preview.title_text_w,
-            preview.title_text_h.min(TITLE_STRIP_HEIGHT),
+            preview.title_text_h,
         )?;
 
         if preview.showing_dps {
             if let Some(pic) = preview.dps_in_picture {
-                let ty = (TITLE_STRIP_HEIGHT as i16 - preview.dps_in_h as i16) / 2;
-                conn.render_composite(
-                    PictOp::OVER,
+                let tx = bands.dps_in.x + TITLE_TEXT_LEFT_PAD as i32 - HALO_PAD;
+                let ty = bands.dps_in.y + (bands.dps_in.h - preview.dps_in_h as i32) / 2;
+                composite_over(
+                    &self.conn,
                     pic,
-                    x11rb::NONE,
-                    preview.render_picture,
-                    0,
-                    0,
-                    0,
-                    0,
-                    TITLE_TEXT_LEFT_PAD,
-                    ty.max(0),
+                    dst,
+                    tx,
+                    ty,
                     preview.dps_in_w,
-                    preview.dps_in_h.min(TITLE_STRIP_HEIGHT),
+                    preview.dps_in_h,
                 )?;
             }
             if let Some(pic) = preview.dps_out_picture {
-                let slot = DPS_SLOT_PX as i16;
-                let tx = preview.width as i16 - slot + (slot - preview.dps_out_w as i16).max(0);
-                let ty = (TITLE_STRIP_HEIGHT as i16 - preview.dps_out_h as i16) / 2;
-                conn.render_composite(
-                    PictOp::OVER,
+                let right = bands.dps_out.x + bands.dps_out.w;
+                let tx = right - preview.dps_out_w as i32 + HALO_PAD;
+                let ty = bands.dps_out.y + (bands.dps_out.h - preview.dps_out_h as i32) / 2;
+                composite_over(
+                    &self.conn,
                     pic,
-                    x11rb::NONE,
-                    preview.render_picture,
-                    0,
-                    0,
-                    0,
-                    0,
-                    tx.max(TITLE_TEXT_LEFT_PAD),
-                    ty.max(0),
+                    dst,
+                    tx,
+                    ty,
                     preview.dps_out_w,
-                    preview.dps_out_h.min(TITLE_STRIP_HEIGHT),
+                    preview.dps_out_h,
                 )?;
             }
         }
@@ -557,37 +616,19 @@ impl PreviewManager {
         if let (Some(_text), Some(alert_picture)) =
             (preview.alert_text.as_ref(), preview.alert_picture)
         {
-            let banner_h = ALERT_BANNER_HEIGHT;
-            let banner_y = (preview.height - BORDER_WIDTH - banner_h) as i16;
-            let cream = xcolor(NICOTINE_CREAM, 0xffff);
-            let banner = XRectangle {
-                x: BORDER_WIDTH as i16,
-                y: banner_y,
-                width: preview.width.saturating_sub(BORDER_WIDTH * 2),
-                height: banner_h,
-            };
-            conn.render_fill_rectangles(PictOp::SRC, preview.render_picture, cream, &[banner])?;
-            let text_y = banner_y + (banner_h as i16 - preview.alert_text_h as i16) / 2;
-            let max_w = preview
-                .width
-                .saturating_sub(BORDER_WIDTH * 2)
-                .saturating_sub(TITLE_TEXT_LEFT_PAD as u16);
-            conn.render_composite(
-                PictOp::OVER,
+            let tx = bands.bottom.x + TITLE_TEXT_LEFT_PAD as i32 - HALO_PAD;
+            let ty = bands.bottom.y + (bands.bottom.h - preview.alert_text_h as i32) / 2;
+            let max_w = (bands.bottom.w - TITLE_TEXT_LEFT_PAD as i32 + HALO_PAD * 2).max(0) as u16;
+            composite_over(
+                &self.conn,
                 alert_picture,
-                x11rb::NONE,
-                preview.render_picture,
-                0,
-                0,
-                0,
-                0,
-                TITLE_TEXT_LEFT_PAD,
-                text_y.max(banner_y),
+                dst,
+                tx,
+                ty,
                 preview.alert_text_w.min(max_w),
-                preview.alert_text_h.min(banner_h),
+                preview.alert_text_h,
             )?;
         }
-
         Ok(())
     }
 
@@ -610,10 +651,8 @@ impl PreviewManager {
             preview.source_id,
             preview.source_w,
             preview.source_h,
-            thumbnail_size_with_banner(preview.width, preview.height, preview.alert_text.is_some())
-                .0,
-            thumbnail_size_with_banner(preview.width, preview.height, preview.alert_text.is_some())
-                .1,
+            thumbnail_size(preview.width, preview.height).0,
+            thumbnail_size(preview.width, preview.height).1,
             preview.src_picture,
             preview.src_pixmap,
         );
@@ -684,41 +723,13 @@ impl PreviewManager {
             Some(p) => p,
             None => return Ok(()),
         };
-        // Borrow-juggling: paint_chrome takes &self, but the second half
-        // of this function takes &mut self via previews.get_mut. We do
-        // the chrome paint here with the immutable borrow, then reacquire
-        // mutably below for the composite/present.
-        self.paint_chrome(preview_snapshot)?;
+        // paint_preview_frame takes &self. Mark dirty with a fresh borrow
+        // after it returns so the two don't overlap.
+        self.paint_preview_frame(preview_snapshot)?;
         let preview = match self.previews.get_mut(key) {
             Some(p) => p,
             None => return Ok(()),
         };
-        let banner = if preview.alert_text.is_some() {
-            ALERT_BANNER_HEIGHT as i32
-        } else {
-            0
-        };
-        let (left, top, right, bottom) = thumbnail_dest(
-            preview.width as i32,
-            preview.height as i32,
-            TITLE_STRIP_HEIGHT as i32,
-            BORDER_WIDTH as i32,
-            banner,
-        );
-        self.conn.render_composite(
-            PictOp::SRC,
-            preview.src_picture,
-            x11rb::NONE,
-            preview.render_picture,
-            0,
-            0,
-            0,
-            0,
-            left as i16,
-            top as i16,
-            (right - left) as u16,
-            (bottom - top) as u16,
-        )?;
         // Blit the finished offscreen frame straight onto the window with one
         // composite — no X Present extension (see `window_picture`).
         self.conn.render_composite(

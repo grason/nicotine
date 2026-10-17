@@ -16,7 +16,9 @@ use x11rb::protocol::render::{
 use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
-use super::{BORDER_WIDTH, TITLE_STRIP_HEIGHT};
+use crate::preview_common::{cover_with_halo, HALO_PAD};
+
+use super::BORDER_WIDTH;
 
 /// XFixed is signed 16.16 fixed-point. 1.0 == 0x10000.
 pub(super) const XFIXED_ONE: i32 = 0x10000;
@@ -64,24 +66,12 @@ pub(super) fn marlboro() -> &'static FontRef<'static> {
 }
 
 /// (Width, height) of the thumbnail area within a preview window.
-/// Subtracts the title strip from the top and the border on left,
-/// right, and bottom. When `banner` is set, also subtracts the alert
-/// strip above the bottom border so the composite doesn't cover it.
+/// Insets the border on every side. Labels are drawn on top, so an
+/// alert does not change the size.
 pub(super) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
-    thumbnail_size_with_banner(window_w, window_h, false)
-}
-
-pub(super) fn thumbnail_size_with_banner(window_w: u16, window_h: u16, banner: bool) -> (u16, u16) {
-    let extra = if banner {
-        crate::preview_common::ALERT_BANNER_PX as u16
-    } else {
-        0
-    };
-    let w = window_w.saturating_sub(BORDER_WIDTH * 2);
-    let h = window_h
-        .saturating_sub(TITLE_STRIP_HEIGHT)
-        .saturating_sub(BORDER_WIDTH)
-        .saturating_sub(extra);
+    let inset = BORDER_WIDTH.saturating_mul(2);
+    let w = window_w.saturating_sub(inset);
+    let h = window_h.saturating_sub(inset);
     (w.max(1), h.max(1))
 }
 
@@ -203,12 +193,13 @@ pub(super) fn rasterize_text(font: &FontRef<'_>, text: &str, font_px: f32) -> (V
     (buf, width, height)
 }
 
-/// Build the per-preview title text resources: a depth-32 pixmap with
-/// the character name pre-rasterized and color-baked, plus an XRender
-/// Picture (ARGB32) wrapping it. Each pixel is premultiplied:
-/// `(cream.r * a, cream.g * a, cream.b * a, a)` so PictOp::OVER blends
-/// it directly onto whatever chrome color is underneath. Caller owns
-/// both resources; drop via render_free_picture + free_pixmap.
+/// Build a depth-32 pixmap with `text` pre-rasterized and color-baked,
+/// plus an XRender Picture (ARGB32) wrapping it. Each pixel is
+/// premultiplied so PictOp::OVER blends it directly. Caller owns both
+/// resources; drop via render_free_picture + free_pixmap.
+///
+/// The list window uses this path (no halo — the text sits on a flat
+/// fill). Labels drawn on a live thumbnail use [`create_halo_text_pixmap`].
 pub(super) fn create_text_pixmap(
     conn: &RustConnection,
     parent_drawable: Window,
@@ -232,12 +223,46 @@ pub(super) fn create_text_pixmap(
         bgra.push(a);
     }
 
+    let (pixmap, picture) = upload_bgra_pixmap(conn, parent_drawable, &bgra, w, h, argb32_format)?;
+    Ok((pixmap, picture, w, h))
+}
+
+/// [`create_text_pixmap`] plus a 1px black halo. The returned size
+/// includes the halo, so centering that size keeps the glyphs centered.
+/// Left-aligned callers subtract [`HALO_PAD`] from the destination x.
+pub(super) fn create_halo_text_pixmap(
+    conn: &RustConnection,
+    parent_drawable: Window,
+    text: &str,
+    color: (u8, u8, u8),
+    font: &FontRef<'_>,
+    size_px: f32,
+    argb32_format: u32,
+) -> Result<(u32, u32, u16, u16)> {
+    let (alpha_buf, w, h) = rasterize_text(font, text, size_px);
+    let bgra = cover_with_halo(&alpha_buf, w as i32, h as i32, color, HALO_PAD);
+    let pad = HALO_PAD.max(0) as u16;
+    let out_w = w.saturating_add(pad.saturating_mul(2)).max(1);
+    let out_h = h.saturating_add(pad.saturating_mul(2)).max(1);
+    let (pixmap, picture) =
+        upload_bgra_pixmap(conn, parent_drawable, &bgra, out_w, out_h, argb32_format)?;
+    Ok((pixmap, picture, out_w, out_h))
+}
+
+fn upload_bgra_pixmap(
+    conn: &RustConnection,
+    parent_drawable: Window,
+    bgra: &[u8],
+    w: u16,
+    h: u16,
+    argb32_format: u32,
+) -> Result<(u32, u32)> {
     let pixmap = conn.generate_id()?;
     conn.create_pixmap(32, pixmap, parent_drawable, w, h)?;
 
     let gc = conn.generate_id()?;
     conn.create_gc(gc, pixmap, &CreateGCAux::new())?;
-    conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc, w, h, 0, 0, 0, 32, &bgra)?;
+    conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc, w, h, 0, 0, 0, 32, bgra)?;
     conn.free_gc(gc)?;
 
     let picture = conn.generate_id()?;
@@ -248,5 +273,5 @@ pub(super) fn create_text_pixmap(
         &RenderCreatePictureAux::new(),
     )?;
 
-    Ok((pixmap, picture, w, h))
+    Ok((pixmap, picture))
 }

@@ -2,10 +2,9 @@
 //
 // Per-EVE-client always-on-top, undecorated preview windows. Live source
 // mirror via XComposite redirect + XRender server-side composite. Chrome:
-//   - Nicotine-red title strip with the character name (white text,
-//     JetBrains Mono rasterized via ab_glyph)
-//   - 3px border around the thumbnail; flips to Nicotine red when the
-//     source is the system foreground window, dark otherwise
+//   - 3px frame. Nicotine red when the source is focused or taking
+//     damage, gold when an inactive client has a live alert, dark otherwise
+//   - Name, DPS, and alert text drawn on the thumbnail (1px black halo)
 //
 // override_redirect = true lifts WM management (no titlebar, no taskbar
 // entry, no alt-tab inclusion) so we own the entire surface. We re-assert
@@ -89,9 +88,8 @@ const WINDOW_SCAN_BACKSTOP: Duration = Duration::from_secs(2);
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 // Phase 3 still hardcodes preview dimensions; Phase 4 (live size sliders)
-// will pull these from config / LiveSettings. Includes chrome — a 480×270
-// preview is 480×270 total, with 24px title + 3px border eating into the
-// thumbnail area.
+// will pull these from config / LiveSettings. The window size includes the
+// frame. The thumbnail fills the interior; labels sit on the picture.
 const PREVIEW_WIDTH: u16 = 480;
 const PREVIEW_HEIGHT: u16 = 270;
 
@@ -714,11 +712,7 @@ impl PreviewManager {
                 preview.dirty = true;
             }
 
-            let banner = self
-                .previews
-                .get(&name)
-                .is_some_and(|p| p.alert_text.is_some());
-            let (thumb_w, thumb_h) = thumbnail_size_with_banner(want_w, want_h, banner);
+            let (thumb_w, thumb_h) = thumbnail_size(want_w, want_h);
             let _ = apply_scale_transform(
                 &self.conn,
                 src_picture,
@@ -824,9 +818,6 @@ impl PreviewManager {
                 if let Some(p) = self.previews.get_mut(&name) {
                     p.dirty = true;
                 }
-                if alert_changed {
-                    self.recompute_thumb_transform(&name);
-                }
             }
         }
 
@@ -850,7 +841,7 @@ impl PreviewManager {
             Some(p) => p.window,
             None => return Ok(()),
         };
-        let (pixmap, picture, w, h) = create_text_pixmap(
+        let (pixmap, picture, w, h) = create_halo_text_pixmap(
             &self.conn,
             window,
             label,
@@ -877,7 +868,7 @@ impl PreviewManager {
             None => return Ok(()),
         };
         let new = if let Some(text) = text {
-            let (pixmap, picture, w, h) = create_text_pixmap(
+            let (pixmap, picture, w, h) = create_halo_text_pixmap(
                 &self.conn,
                 window,
                 text,
@@ -924,7 +915,7 @@ impl PreviewManager {
             None => return Ok(()),
         };
         let new_in = if showing {
-            let (pixmap, picture, w, h) = create_text_pixmap(
+            let (pixmap, picture, w, h) = create_halo_text_pixmap(
                 &self.conn,
                 window,
                 in_label,
@@ -938,7 +929,7 @@ impl PreviewManager {
             None
         };
         let new_out = if showing {
-            let (pixmap, picture, w, h) = create_text_pixmap(
+            let (pixmap, picture, w, h) = create_halo_text_pixmap(
                 &self.conn,
                 window,
                 out_label,
@@ -987,22 +978,6 @@ impl PreviewManager {
             }
         }
         Ok(())
-    }
-
-    fn recompute_thumb_transform(&mut self, key: &str) {
-        let Some(p) = self.previews.get(key) else {
-            return;
-        };
-        let (thumb_w, thumb_h) =
-            thumbnail_size_with_banner(p.width, p.height, p.alert_text.is_some());
-        let _ = apply_scale_transform(
-            &self.conn,
-            p.src_picture,
-            p.source_w,
-            p.source_h,
-            thumb_w,
-            thumb_h,
-        );
     }
 
     /// Enumerate EVE client windows from `_NET_CLIENT_LIST`. Same X11
