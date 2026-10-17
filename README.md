@@ -20,6 +20,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Live preview windows** per EVE client — XComposite + XRender on Linux, DWM thumbnails on Windows
 - **List display mode** — compact roster window as an alternative to per-client previews
 - **Compact grid** — one window of live thumbnails, for a lot of accounts
+- **Log alerts** — marks for fleet, tackle, mining, and the rest, plus crossed swords when a client takes damage
 - **Config panel** for character order, per-character jump hotkeys, preview sizing, and display mode
 - **Daemon architecture** for near-zero-latency window switching
 - **Auto-stack windows** to perfectly center multiple EVE clients
@@ -73,15 +74,7 @@ nicotine 2              # Jump to client 2
 
 ### Targeted Cycling
 
-By default, `nicotine 1`, `nicotine 2`, etc. use window detection order. To define your own order, create `~/.config/nicotine/characters.txt`:
-
-```
-Main Character
-Alt One
-Alt Two
-```
-
-Each line is a character name (without "EVE - " prefix). Line 1 = target 1, line 2 = target 2, etc. Bind these commands to hotkeys in your desktop environment for quick access.
+`nicotine 1`, `nicotine 2`, and so on follow the cycle order. Set that order in the config panel (Cycle Order). It is saved as `characters` in `~/.config/nicotine/config.toml`. With no order saved, the commands follow window detection order. Bind the commands to hotkeys in your desktop environment for quick access.
 
 ### Mouse Bindings
 
@@ -179,7 +172,7 @@ sudo evtest /dev/input/eventX # Replace X with the correct event number i.e even
 
 ### Config Panel & Previews
 
-`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has five sections: **Display Mode** (Previews vs List), **Cycle Order** (character list + per-character jump hotkeys), **Keyboard Hotkeys**, **Preview Windows** (size sliders, show/hide toggle), and **Alerts** (EVE log monitoring). Changes apply live; saves debounce to disk.
+`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has five sections: **Display Mode** (Previews, Grid, or List), **Cycle Order** (character list + per-character jump hotkeys), **Keyboard Hotkeys**, **Preview Windows** (size sliders, show/hide toggle), and **Alerts** (EVE log monitoring). Changes apply live; saves debounce to disk.
 
 Previews and the list window:
 - **Left-click-drag** to reposition; edges snap to adjacent windows
@@ -191,10 +184,32 @@ Previews and the list window:
 The Alerts tab tails EVE's Chatlogs and Gamelogs (read-only). Enable it there.
 
 - Preview title strips show `Character - Jita` once a system is known
-- Incoming (↓) / outgoing (↑) DPS from the combat log sit on the left and right of the preview title; they hide when idle and are not mixed with the event banners
-- Taking damage flashes that client's preview chrome red for a moment (coalesced so a volley is one pulse, not a strobe)
-- Inactive clients flash a short banner + gold border for fleet invites, follow/warp, regroups, and compression (decloak / convo / crystal-broke are off by default)
-- Alerts clear when you focus that client
+- Incoming (↓) / outgoing (↑) DPS from the combat log sit on the left and right of the preview title. They hide when idle
+- Taking damage shows crossed swords and flashes that client's frame red for a moment (coalesced so a volley is one pulse). The swords use the icon slot for the whole flash, including on the client you are flying
+- An event icon sits in the middle of that client's thumbnail, and at the right of its list row. The frame turns gold on an inactive client while that icon is up. The character name stays
+
+| | Shown for | Default |
+| --- | --- | --- |
+| <img src="assets/alerts/damage.png" width="40" alt="Crossed swords"> | Taking damage | On while monitoring is enabled |
+| <img src="assets/alerts/fleet_invite.png" width="40" alt="Envelope"> | Fleet invite | On |
+| <img src="assets/alerts/follow_warp.png" width="40" alt="Rocket"> | Follow / warp | On |
+| <img src="assets/alerts/regroup.png" width="40" alt="Pin"> | Regroup | On |
+| <img src="assets/alerts/compression.png" width="40" alt="Package"> | Compression cycle | On |
+| <img src="assets/alerts/scramble.png" width="40" alt="Swirl"> | Warp scramble from a player | On, under Player tackle |
+| <img src="assets/alerts/disrupt.png" width="40" alt="Bolt"> | Warp disruption from a player | On, under Player tackle |
+| <img src="assets/alerts/jam.png" width="40" alt="Dish"> | Jammed by a player | On, under Player tackle |
+| <img src="assets/alerts/bubble.png" width="40" alt="Bubbles"> | Warp disruption bubble | On, under Player tackle |
+| <img src="assets/alerts/out_of_charges.png" width="40" alt="Low battery"> | Module out of charges | On |
+| <img src="assets/alerts/cargo_full.png" width="40" alt="Suitcase"> | Cargo or ore hold full | On, under Mining |
+| <img src="assets/alerts/mining_range.png" width="40" alt="Ruler"> | Miner beyond range | On, under Mining |
+| <img src="assets/alerts/decloak.png" width="40" alt="Eye"> | Decloak | Off |
+| <img src="assets/alerts/convo_request.png" width="40" alt="Balloon"> | Conversation request | Off |
+| <img src="assets/alerts/crystal_broke.png" width="40" alt="Gem"> | Mining crystal broke | Off |
+
+The icons are Twemoji graphics by Twitter, Inc., [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/), via [jdecked/twemoji](https://github.com/jdecked/twemoji).
+
+Scramble, point, and jam only count when the other pilot's name has a corp ticker. A bubble always counts. Sleepers and other rats do not light the tackle icons.
+- Keep the icon until you switch to that client, or clear it after a timeout. The Alerts tab chooses
 - On Linux, Nicotine looks for logs in the running EVE client's Wine prefix; override the directories if auto-detect misses
 
 ## Configuration
@@ -286,7 +301,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Build
 cargo build --release
 
-# Binary at: target/release/nicotine
+# Binary at: target/release/Nicotine
 ```
 
 ## License

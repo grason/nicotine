@@ -2,9 +2,10 @@
 //!
 //! DWM draws the mirror above GDI in the owner window, so a name painted
 //! in `WM_PAINT` disappears wherever the thumbnail dest overlaps it.
-//! Labels live in an owned layered popup instead. `WS_EX_TRANSPARENT`
-//! lets click and drag hit the owner. The owner is topmost; ownership
-//! keeps this window above it without its own `WS_EX_TOPMOST`.
+//! Labels and the centered alert icon live in an owned layered popup
+//! instead. `WS_EX_TRANSPARENT` lets click and drag hit the owner. The
+//! owner is topmost; ownership keeps this window above it without its
+//! own `WS_EX_TOPMOST`.
 //!
 //! `SetLayeredWindowAttributes` and `UpdateLayeredWindow` cannot combine
 //! on one HWND, so the opacity slider is baked into the bitmap. GDI
@@ -14,18 +15,22 @@
 
 use std::sync::OnceLock;
 
+use crate::alert_icon::{alert_icon_px, raster_icon, shown_icon, ShownIcon};
+use crate::eve_logs::AlertKind;
 use crate::preview_common::{
-    cover_with_halo, overlay_label_bands, GridRect, ALERT_BANNER_PX, DPS_SLOT_PX, HALO_PAD,
+    cover_with_halo, grid_thumb_bounds, overlay_label_bands, thumbnail_dest, GridCell, GridRect,
+    DPS_SLOT_PX, HALO_PAD,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DrawTextW, GetDC, ReleaseDC,
-    SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY,
-    BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HFONT, TRANSPARENT,
+    AlphaBlend, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DrawTextW, GetDC,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
+    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
+    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -244,13 +249,24 @@ pub(super) fn colorref_rgb(color: COLORREF) -> (u8, u8, u8) {
     )
 }
 
-/// Premultiplied BGRA for `glyphs`, with the frame rects in `clear`
-/// punched back to transparent so a halo cannot cover the state border.
-/// `opacity` is the layered-window byte (255 = opaque).
+/// One premultiplied icon already including its halo.
+pub(super) struct Sprite<'a> {
+    pub pixels: &'a [u8],
+    pub w: i32,
+    pub h: i32,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Premultiplied BGRA for `glyphs` and `sprites`, with the frame rects
+/// in `clear` punched back to transparent so a halo cannot cover the
+/// state border. Sprites are blended before the opacity scale and
+/// before the punch. `opacity` is the layered-window byte (255 = opaque).
 pub(super) fn compose(
     width: i32,
     height: i32,
     glyphs: &[Glyph],
+    sprites: &[Sprite<'_>],
     opacity: u8,
     clear: &[RECT],
 ) -> Vec<u8> {
@@ -298,6 +314,20 @@ pub(super) fn compose(
             },
         );
     }
+    for sprite in sprites {
+        blit_over(
+            &mut dest,
+            width,
+            height,
+            Blit {
+                pixels: sprite.pixels,
+                w: sprite.w,
+                h: sprite.h,
+                x: sprite.x,
+                y: sprite.y,
+            },
+        );
+    }
     if opacity < 255 {
         for channel in &mut dest {
             *channel = (*channel as u16 * opacity as u16 / 255) as u8;
@@ -325,7 +355,7 @@ pub(super) fn preview_pixels(
         },
         border,
         px(TITLE_HEIGHT),
-        px(ALERT_BANNER_PX),
+        0,
         px(DPS_SLOT_PX),
     );
     let font = overlay_body_font();
@@ -362,33 +392,38 @@ pub(super) fn preview_pixels(
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
-    if let Some(alert) = &state.alert_text {
-        let mut band = rect_of(bands.bottom);
-        band.left += pad;
-        band.right -= px(4);
-        push_glyph(
-            &mut glyphs,
-            alert,
-            colorref_rgb(super::NICOTINE_RED),
-            band,
-            font,
-            DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
+    let (left, top, right, bottom) = thumbnail_dest(width, height, border);
+    let mut rasters = Vec::new();
+    if let Some(icon) = shown_icon(state.taking_damage, state.alert_kind) {
+        if let Some(drawn) = centered_icon(
+            icon,
+            GridRect {
+                x: left,
+                y: top,
+                w: right - left,
+                h: bottom - top,
+            },
+        ) {
+            rasters.push(drawn);
+        }
     }
+    let sprites = sprites_of(&rasters);
     let clear = frame_rects(width, height, border);
-    compose(width, height, &glyphs, opacity, &clear)
+    compose(width, height, &glyphs, &sprites, opacity, &clear)
 }
 
-/// One grid cell's label. `alert` selects gold; otherwise the name is cream.
+/// One grid cell's name plus the alert icon, if any. The name stays cream.
+/// `taking` draws crossed swords in the icon slot for the damage flash.
 pub(super) struct GridLabel {
     pub cell: GridRect,
     pub text: String,
-    pub alert: bool,
+    pub kind: Option<AlertKind>,
+    pub taking: bool,
 }
 
-/// Names (or gold alert labels) along the bottom of each cell. The outer
-/// border and each cell frame are punched clear so the halo stays off
-/// the GDI state border underneath.
+/// Cream names along the bottom of each cell, and an icon centered
+/// on the thumbnail. The outer border and each cell frame are punched
+/// clear so a text halo stays off the GDI state border underneath.
 pub(super) fn grid_pixels(
     width: i32,
     height: i32,
@@ -400,23 +435,64 @@ pub(super) fn grid_pixels(
 ) -> Vec<u8> {
     let font = grid_font();
     let cream = colorref_rgb(super::NICOTINE_CREAM);
-    let gold = colorref_rgb(super::NICOTINE_GOLD);
     let mut glyphs = Vec::new();
+    let mut rasters = Vec::new();
     let mut clear = frame_rects(width, height, outer_border);
     for label in labels {
         let band = overlay_label_bands(label.cell, inset, scrim, scrim, 0).bottom;
-        let color = if label.alert { gold } else { cream };
         push_glyph(
             &mut glyphs,
             &label.text,
-            color,
+            cream,
             rect_of(band),
             font,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+        if let Some(icon) = shown_icon(label.taking, label.kind) {
+            let bounds = grid_thumb_bounds(
+                GridCell {
+                    index: 0,
+                    x: label.cell.x,
+                    y: label.cell.y,
+                    w: label.cell.w,
+                    h: label.cell.h,
+                },
+                inset,
+            );
+            if let Some(drawn) = centered_icon(icon, bounds) {
+                rasters.push(drawn);
+            }
+        }
         clear.extend(cell_frame_rects(label.cell, inset));
     }
-    compose(width, height, &glyphs, opacity, &clear)
+    let sprites = sprites_of(&rasters);
+    compose(width, height, &glyphs, &sprites, opacity, &clear)
+}
+
+/// Icon centered in `bounds`. The bitmap includes a 1px transparent pad.
+fn centered_icon(icon: ShownIcon, bounds: GridRect) -> Option<(Vec<u8>, i32, i32, i32)> {
+    if bounds.w <= 0 || bounds.h <= 0 {
+        return None;
+    }
+    let icon_px = alert_icon_px(bounds.w.min(bounds.h), super::dpi_scale());
+    let side = icon_px + HALO_PAD * 2;
+    let raster = raster_icon(icon, icon_px);
+    let x = bounds.x + (bounds.w - side) / 2;
+    let y = bounds.y + (bounds.h - side) / 2;
+    Some((raster, side, x, y))
+}
+
+fn sprites_of(rasters: &[(Vec<u8>, i32, i32, i32)]) -> Vec<Sprite<'_>> {
+    rasters
+        .iter()
+        .map(|(pixels, side, x, y)| Sprite {
+            pixels,
+            w: *side,
+            h: *side,
+            x: *x,
+            y: *y,
+        })
+        .collect()
 }
 
 pub(super) fn grid_font() -> HFONT {
@@ -635,6 +711,59 @@ fn blit_over(dest: &mut [u8], dest_w: i32, dest_h: i32, src: Blit<'_>) {
             }
         }
     }
+}
+
+/// Alpha-blend a top-down premultiplied BGRA bitmap onto `hdc`.
+/// Used by the client list, which is GDI rather than a layered popup.
+pub(super) unsafe fn blit_premul(hdc: HDC, x: i32, y: i32, pixels: &[u8], w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let Some(need) = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return;
+    };
+    if pixels.len() < need {
+        return;
+    }
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
+    };
+    let Ok(bitmap) = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+        return;
+    };
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap.into());
+        return;
+    }
+    std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, need);
+    let mem = CreateCompatibleDC(Some(hdc));
+    if mem.is_invalid() {
+        let _ = DeleteObject(bitmap.into());
+        return;
+    }
+    let old = SelectObject(mem, bitmap.into());
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let _drawn = AlphaBlend(hdc, x, y, w, h, mem, 0, 0, w, h, blend).as_bool();
+    let _ = SelectObject(mem, old);
+    let _ = DeleteObject(bitmap.into());
+    let _ = DeleteDC(mem);
 }
 
 fn clear_rect(dest: &mut [u8], dest_w: i32, dest_h: i32, rect: RECT) {

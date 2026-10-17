@@ -7,7 +7,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 
-use crate::config::DisplayMode;
+use crate::config::{AlertClear, DisplayMode};
 use crate::preview_common::{grid_layout, GRID_GAP_PX, GRID_OUTER_BORDER_PX};
 
 use super::{
@@ -455,13 +455,13 @@ fn alerts_section(panel: &Panel) -> Element<'_, Message> {
     let dirs = crate::eve_logs::resolve(&panel.config.logs);
     let logs = &panel.config.logs;
 
-    column![
+    let mut col = column![
         section_header("Log Monitoring"),
         caption(
             "Read-only tail of EVE Chatlogs and Gamelogs. Preview titles show Name - System, \
-             incoming / outgoing DPS on the left and right, and a red flash when that client \
-             takes damage. Event banners sit on the preview, separate from DPS. Nothing is \
-             written back into the game."
+             incoming / outgoing DPS on the left and right, and a red flash and crossed swords \
+             when that client takes damage. Event icons sit on the preview, separate from DPS. \
+             Nothing is written back into the game."
         ),
         checkbox(logs.enabled)
             .label("Enable log monitoring")
@@ -473,56 +473,120 @@ fn alerts_section(panel: &Panel) -> Element<'_, Message> {
             .label("Show incoming / outgoing DPS on preview titles")
             .on_toggle(Message::ShowDpsToggled),
         checkbox(logs.alerts_on_inactive_only)
-            .label("Event banners on inactive clients only")
+            .label("Event icons on inactive clients only")
             .on_toggle(Message::AlertsInactiveOnlyToggled),
-        section_header("Alert types"),
-        caption(
-            "Each enabled type shows a short banner and gold border on that client's preview. \
-             Incoming damage flash is always on while monitoring is enabled."
+        caption("Keep the icon until you switch to that client, or clear it after a timeout."),
+        radio(
+            "Keep until you switch to that client",
+            AlertClear::UntilFocus,
+            Some(logs.alert_clear),
+            Message::AlertClearChanged,
         ),
-        checkbox(logs.alerts.fleet_invite)
-            .label("Fleet invite")
-            .on_toggle(Message::FleetInviteToggled),
-        checkbox(logs.alerts.follow_warp)
-            .label("Follow / warp")
-            .on_toggle(Message::FollowWarpToggled),
-        checkbox(logs.alerts.regroup)
-            .label("Regroup")
-            .on_toggle(Message::RegroupToggled),
-        checkbox(logs.alerts.compression)
-            .label("Compression cycle")
-            .on_toggle(Message::CompressionToggled),
-        checkbox(logs.alerts.decloak)
-            .label("Decloak")
-            .on_toggle(Message::DecloakToggled),
-        checkbox(logs.alerts.convo_request)
-            .label("Conversation request")
-            .on_toggle(Message::ConvoRequestToggled),
-        checkbox(logs.alerts.crystal_broke)
-            .label("Mining crystal broke")
-            .on_toggle(Message::CrystalBrokeToggled),
-        section_header("Log directories"),
-        caption(
-            "Leave blank to auto-detect (Windows Documents, or the Wine prefix of a running \
-             EVE client on Linux). Overrides are used as-is."
+        radio(
+            "Clear after a timeout",
+            AlertClear::Timeout,
+            Some(logs.alert_clear),
+            Message::AlertClearChanged,
         ),
-        text("Chatlogs").size(CAPTION_SIZE).color(NICOTINE_BLACK),
-        text_input("auto", &logs.chatlog_dir)
-            .on_input(Message::ChatlogDirChanged)
-            .width(Length::Fill),
-        text(format!("using {}", dirs.chatlogs.display()))
-            .size(CAPTION_SIZE)
-            .color(NICOTINE_GOLD),
-        text("Gamelogs").size(CAPTION_SIZE).color(NICOTINE_BLACK),
-        text_input("auto", &logs.gamelog_dir)
-            .on_input(Message::GamelogDirChanged)
-            .width(Length::Fill),
-        text(format!("using {}", dirs.gamelogs.display()))
-            .size(CAPTION_SIZE)
-            .color(NICOTINE_GOLD),
     ]
-    .spacing(8)
-    .into()
+    .spacing(8);
+
+    if logs.alert_clear == AlertClear::Timeout {
+        col = col.push(slider_field(
+            panel,
+            SliderField::AlertSecs,
+            "Seconds:",
+            logs.alert_secs,
+            "s",
+        ));
+    }
+
+    col = col
+        .push(section_header("Alert types"))
+        .push(caption(
+            "Each enabled type draws an icon on that client's preview, grid cell, and list row. \
+             The frame turns gold on an inactive client. Incoming damage shows crossed swords \
+             and a red frame while monitoring is enabled.",
+        ))
+        .push(
+            checkbox(logs.alerts.fleet_invite)
+                .label("Fleet invite")
+                .on_toggle(Message::FleetInviteToggled),
+        )
+        .push(
+            checkbox(logs.alerts.follow_warp)
+                .label("Follow / warp")
+                .on_toggle(Message::FollowWarpToggled),
+        )
+        .push(
+            checkbox(logs.alerts.regroup)
+                .label("Regroup")
+                .on_toggle(Message::RegroupToggled),
+        )
+        .push(
+            checkbox(logs.alerts.compression)
+                .label("Compression cycle")
+                .on_toggle(Message::CompressionToggled),
+        )
+        .push(
+            checkbox(logs.alerts.decloak)
+                .label("Decloak")
+                .on_toggle(Message::DecloakToggled),
+        )
+        .push(
+            checkbox(logs.alerts.convo_request)
+                .label("Conversation request")
+                .on_toggle(Message::ConvoRequestToggled),
+        )
+        .push(
+            checkbox(logs.alerts.crystal_broke)
+                .label("Mining crystal broke")
+                .on_toggle(Message::CrystalBrokeToggled),
+        )
+        .push(
+            checkbox(logs.alerts.tackle)
+                .label("Player tackle (scram, point, jam, bubble)")
+                .on_toggle(Message::TackleToggled),
+        )
+        .push(
+            checkbox(logs.alerts.out_of_charges)
+                .label("Module out of charges")
+                .on_toggle(Message::OutOfChargesToggled),
+        )
+        .push(
+            checkbox(logs.alerts.mining)
+                .label("Mining hold full or out of range")
+                .on_toggle(Message::MiningToggled),
+        )
+        .push(section_header("Log directories"))
+        .push(caption(
+            "Leave blank to auto-detect (Windows Documents, or the Wine prefix of a running \
+             EVE client on Linux). Overrides are used as-is.",
+        ))
+        .push(text("Chatlogs").size(CAPTION_SIZE).color(NICOTINE_BLACK))
+        .push(
+            text_input("auto", &logs.chatlog_dir)
+                .on_input(Message::ChatlogDirChanged)
+                .width(Length::Fill),
+        )
+        .push(
+            text(format!("using {}", dirs.chatlogs.display()))
+                .size(CAPTION_SIZE)
+                .color(NICOTINE_GOLD),
+        )
+        .push(text("Gamelogs").size(CAPTION_SIZE).color(NICOTINE_BLACK))
+        .push(
+            text_input("auto", &logs.gamelog_dir)
+                .on_input(Message::GamelogDirChanged)
+                .width(Length::Fill),
+        )
+        .push(
+            text(format!("using {}", dirs.gamelogs.display()))
+                .size(CAPTION_SIZE)
+                .color(NICOTINE_GOLD),
+        );
+
+    col.into()
 }
 
 fn previews_section(panel: &Panel) -> Element<'_, Message> {

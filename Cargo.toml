@@ -50,6 +50,9 @@ uuid = { version = "1", features = ["v4"] }
 # only the resulting pixmap goes to the X server, so this is a one-shot
 # cost at preview creation, not per-frame.
 ab_glyph = "0.2"
+# Alert marks are vendored Twemoji PNGs. png-only so the runtime
+# decoder stays small; build.rs already uses `image` for the exe icon.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Shared HTTP client used by both the version-check (Linux only) and the
 # launch telemetry ping (cross-platform). rustls-tls keeps it pure-ish
 # Rust so cargo-xwin cross-builds work without a system OpenSSL/SChannel.

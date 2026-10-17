@@ -10,6 +10,7 @@ mod paths;
 mod state;
 mod tail;
 
+pub use parse::AlertKind;
 pub use paths::resolve;
 pub use state::LogLiveState;
 pub use tail::spawn;

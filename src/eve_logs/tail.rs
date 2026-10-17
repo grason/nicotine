@@ -114,7 +114,7 @@ fn run(
         {
             let now = Instant::now();
             let mut g = live.lock().unwrap();
-            g.prune_expired(now);
+            g.prune_expired(now, cfg.alert_clear);
             dps.flush_into(&mut g, now);
         }
 
@@ -305,12 +305,13 @@ fn apply_event(
             let secs = cfg.alert_secs.max(1) as u64;
             let alert = ActiveAlert {
                 kind,
-                text: text.clone(),
+                text,
                 expires_at: Instant::now() + Duration::from_secs(secs),
             };
             debug_log(format_args!(
-                "alert {character}: {} — {text}",
-                kind.as_str()
+                "alert {character}: {} — {}",
+                alert.kind.as_str(),
+                alert.text
             ));
             live.lock()
                 .unwrap()
@@ -359,6 +360,11 @@ fn alert_enabled(toggles: &AlertToggles, kind: AlertKind) -> bool {
         AlertKind::Decloak => toggles.decloak,
         AlertKind::CrystalBroke => toggles.crystal_broke,
         AlertKind::ConvoRequest => toggles.convo_request,
+        AlertKind::Scramble | AlertKind::Disrupt | AlertKind::Jam | AlertKind::Bubble => {
+            toggles.tackle
+        }
+        AlertKind::OutOfCharges => toggles.out_of_charges,
+        AlertKind::CargoFull | AlertKind::MiningRange => toggles.mining,
     }
 }
 

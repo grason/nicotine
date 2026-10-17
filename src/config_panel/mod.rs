@@ -75,8 +75,8 @@ pub(super) enum Tab {
 /// A slider whose value can also be typed into its readout. Centralizes the
 /// per-slider range and apply-message so the view helper and `update` agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// The current sliders all control preview-window settings, so the shared
-// `Preview` prefix is meaningful rather than redundant.
+// Several variants share the `Preview` prefix because they all size a
+// preview window. The name is the setting, not a redundant prefix.
 #[allow(clippy::enum_variant_names)]
 pub(super) enum SliderField {
     PreviewWidth,
@@ -90,6 +90,8 @@ pub(super) enum SliderField {
     GridColumns,
     /// Compact-grid cell width in reference pixels.
     GridCellWidth,
+    /// How long an icon stays when clear-after-timeout is selected.
+    AlertSecs,
 }
 
 impl SliderField {
@@ -105,6 +107,7 @@ impl SliderField {
                 crate::preview_common::GRID_CELL_WIDTH_MIN
                     ..=crate::preview_common::GRID_CELL_WIDTH_MAX
             }
+            SliderField::AlertSecs => 2..=120,
         }
     }
 
@@ -118,6 +121,7 @@ impl SliderField {
             SliderField::PreviewSize => Message::PreviewSizeChanged(value),
             SliderField::GridColumns => Message::GridColumnsChanged(value),
             SliderField::GridCellWidth => Message::GridCellWidthChanged(value),
+            SliderField::AlertSecs => Message::AlertSecsChanged(value),
         }
     }
 
@@ -138,6 +142,7 @@ impl SliderField {
             SliderField::PreviewOpacity => panel.config.preview_opacity,
             SliderField::GridColumns => panel.config.grid_columns,
             SliderField::GridCellWidth => panel.config.grid_cell_width,
+            SliderField::AlertSecs => panel.config.logs.alert_secs,
         }
     }
 }
@@ -298,6 +303,7 @@ impl Panel {
             SliderField::GridCellWidth,
             config.grid_cell_width.to_string(),
         );
+        slider_text.insert(SliderField::AlertSecs, config.logs.alert_secs.to_string());
         let aspect_ratio = aspect_ratio_of(config.preview_width, config.preview_height);
 
         // Hide Restack where it can't work. Only GNOME Wayland blocks
@@ -454,6 +460,11 @@ pub(super) enum Message {
     DecloakToggled(bool),
     ConvoRequestToggled(bool),
     CrystalBrokeToggled(bool),
+    TackleToggled(bool),
+    OutOfChargesToggled(bool),
+    MiningToggled(bool),
+    AlertClearChanged(crate::config::AlertClear),
+    AlertSecsChanged(u32),
     ChatlogDirChanged(String),
     GamelogDirChanged(String),
 }
@@ -785,6 +796,29 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::CrystalBrokeToggled(v) => {
             panel.config.logs.alerts.crystal_broke = v;
+            panel.touch();
+        }
+        Message::TackleToggled(v) => {
+            panel.config.logs.alerts.tackle = v;
+            panel.touch();
+        }
+        Message::OutOfChargesToggled(v) => {
+            panel.config.logs.alerts.out_of_charges = v;
+            panel.touch();
+        }
+        Message::MiningToggled(v) => {
+            panel.config.logs.alerts.mining = v;
+            panel.touch();
+        }
+        Message::AlertClearChanged(mode) => {
+            panel.config.logs.alert_clear = mode;
+            panel.touch();
+        }
+        Message::AlertSecsChanged(secs) => {
+            panel.config.logs.alert_secs = secs;
+            panel
+                .slider_text
+                .insert(SliderField::AlertSecs, secs.to_string());
             panel.touch();
         }
         Message::ChatlogDirChanged(s) => {
@@ -1381,6 +1415,7 @@ mod tests {
             SliderField::PreviewSize,
             SliderField::GridColumns,
             SliderField::GridCellWidth,
+            SliderField::AlertSecs,
         ] {
             let r = field.range();
             assert_eq!(field.parse_input("999999"), Some(*r.end()));

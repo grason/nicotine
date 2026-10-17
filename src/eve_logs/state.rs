@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::parse::AlertKind;
+use crate::config::AlertClear;
 
 /// Rolling window used to turn combat hits into a rate. Full-window
 /// divisor so a single volley does not print as thousands of DPS.
@@ -84,7 +85,6 @@ impl DpsTracker {
 
 #[derive(Debug, Clone)]
 pub struct ActiveAlert {
-    #[allow(dead_code)]
     pub kind: AlertKind,
     pub text: String,
     pub expires_at: Instant,
@@ -130,7 +130,12 @@ impl LogLiveState {
             .map(|(_, v)| v.as_str())
     }
 
-    pub fn alert_for(&self, character: &str, now: Instant) -> Option<&ActiveAlert> {
+    pub fn alert_for(
+        &self,
+        character: &str,
+        now: Instant,
+        clear: AlertClear,
+    ) -> Option<&ActiveAlert> {
         let alert = self.alerts.get(character).or_else(|| {
             let needle = character.to_lowercase();
             self.alerts
@@ -138,14 +143,20 @@ impl LogLiveState {
                 .find(|(k, _)| k.eq_ignore_ascii_case(&needle))
                 .map(|(_, v)| v)
         })?;
-        if alert.expired(now) {
+        // Until-focus ignores the timestamp. Switching to the timeout
+        // then hides anything older than `alert_secs`, because the
+        // stamp was set when the line was read.
+        if clear == AlertClear::Timeout && alert.expired(now) {
             None
         } else {
             Some(alert)
         }
     }
 
-    pub fn prune_expired(&mut self, now: Instant) {
+    pub fn prune_expired(&mut self, now: Instant, clear: AlertClear) {
+        if clear == AlertClear::UntilFocus {
+            return;
+        }
         self.alerts.retain(|_, a| !a.expired(now));
     }
 
@@ -211,8 +222,28 @@ mod tests {
                 expires_at: now - Duration::from_secs(1),
             },
         );
-        assert!(s.alert_for("Alpha", now).is_none());
-        s.prune_expired(now);
+        assert!(s.alert_for("Alpha", now, AlertClear::Timeout).is_none());
+        s.prune_expired(now, AlertClear::Timeout);
+        assert!(s.alerts.is_empty());
+    }
+
+    #[test]
+    fn until_focus_keeps_an_expired_stamp() {
+        let mut s = LogLiveState::default();
+        let now = Instant::now();
+        s.alerts.insert(
+            "Alpha".into(),
+            ActiveAlert {
+                kind: AlertKind::Scramble,
+                text: "scramble".into(),
+                expires_at: now - Duration::from_secs(30),
+            },
+        );
+        assert!(s.alert_for("Alpha", now, AlertClear::UntilFocus).is_some());
+        s.prune_expired(now, AlertClear::UntilFocus);
+        assert_eq!(s.alerts.len(), 1);
+        assert!(s.alert_for("Alpha", now, AlertClear::Timeout).is_none());
+        s.prune_expired(now, AlertClear::Timeout);
         assert!(s.alerts.is_empty());
     }
 

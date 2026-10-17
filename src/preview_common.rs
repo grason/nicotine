@@ -43,12 +43,6 @@ pub const DRAG_THRESHOLD_PX: i32 = 4;
 /// docked previews. DPI-scaled on Windows; raw on Linux.
 pub const SNAP_THRESHOLD_PX: i32 = 12;
 
-/// Height of the alert label drawn on the bottom of a preview.
-/// Reference pixels (96 DPI); Windows scales via `px()`, Linux uses
-/// the value raw. The label sits on the thumbnail; it does not reserve
-/// a strip or change the window height.
-pub const ALERT_BANNER_PX: i32 = 18;
-
 /// Title-strip pixels reserved for one DPS figure (`↓10k+` / `↑10k+`).
 /// Tight: just the glyphs, no extra air. 96 DPI; Windows scales via `px()`.
 pub const DPS_SLOT_PX: i32 = 48;

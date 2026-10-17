@@ -14,6 +14,17 @@ pub enum AlertKind {
     Decloak,
     CrystalBroke,
     ConvoRequest,
+    /// Player warp scramble (`to you!`, corp ticker in the name).
+    Scramble,
+    /// Player warp disruption. Same ticker gate as [`Scramble`].
+    Disrupt,
+    /// Player ECM. Same ticker gate as [`Scramble`].
+    Jam,
+    /// Warp disruption zone. No ticker: bubbles are not site rats.
+    Bubble,
+    OutOfCharges,
+    CargoFull,
+    MiningRange,
 }
 
 impl AlertKind {
@@ -26,6 +37,13 @@ impl AlertKind {
             AlertKind::Decloak => "decloak",
             AlertKind::CrystalBroke => "crystal_broke",
             AlertKind::ConvoRequest => "convo_request",
+            AlertKind::Scramble => "scramble",
+            AlertKind::Disrupt => "disrupt",
+            AlertKind::Jam => "jam",
+            AlertKind::Bubble => "bubble",
+            AlertKind::OutOfCharges => "out_of_charges",
+            AlertKind::CargoFull => "cargo_full",
+            AlertKind::MiningRange => "mining_range",
         }
     }
 }
@@ -201,6 +219,15 @@ pub fn parse_line(line: &str) -> Option<Event> {
         if let Some(ev) = parse_conduit(&line) {
             return Some(ev);
         }
+        if let Some(ev) = parse_bubble(&line) {
+            return Some(ev);
+        }
+        if let Some(ev) = parse_out_of_charges(&line) {
+            return Some(ev);
+        }
+        if let Some(ev) = parse_mining_hold(&line) {
+            return Some(ev);
+        }
     }
 
     if contains_ignore_ascii(&line, "(None)") {
@@ -213,6 +240,11 @@ pub fn parse_line(line: &str) -> Option<Event> {
     }
 
     if contains_ignore_ascii(&line, "(combat)") {
+        // Tackle lines share the combat channel with damage. They have
+        // no leading amount, so they must be tried before `parse_combat`.
+        if let Some(ev) = parse_tackle(&line) {
+            return Some(ev);
+        }
         return parse_combat(&line);
     }
 
@@ -367,6 +399,80 @@ fn parse_crystal_broke(line: &str) -> Option<Event> {
         kind: AlertKind::CrystalBroke,
         text: format!("Crystal broke: {crystal}"),
     })
+}
+
+/// Player tackle only. Sleepers and mission rats point you for the
+/// whole site and do not carry a corp ticker, so a `[…]` in the
+/// attacker name is the gate. Bubbles are a separate notify line.
+fn parse_tackle(line: &str) -> Option<Event> {
+    let stripped = strip_html(line);
+    if let Some(ev) = ewar_to_you(
+        &stripped,
+        "Warp scramble attempt from ",
+        AlertKind::Scramble,
+    ) {
+        return Some(ev);
+    }
+    if let Some(ev) = ewar_to_you(
+        &stripped,
+        "Warp disruption attempt from ",
+        AlertKind::Disrupt,
+    ) {
+        return Some(ev);
+    }
+    jammed_by(&stripped)
+}
+
+fn ewar_to_you(stripped: &str, marker: &str, kind: AlertKind) -> Option<Event> {
+    let idx = find_ignore_ascii(stripped, marker)?;
+    let rest = stripped[idx + marker.len()..].trim();
+    let end = find_ignore_ascii(rest, " to you!")?;
+    let who = rest[..end].trim();
+    if !who.contains('[') {
+        return None;
+    }
+    Some(alert_event(kind))
+}
+
+fn jammed_by(stripped: &str) -> Option<Event> {
+    let marker = "jammed by ";
+    let idx = find_ignore_ascii(stripped, marker)?;
+    let who = stripped[idx + marker.len()..].trim();
+    if !who.contains('[') {
+        return None;
+    }
+    Some(alert_event(AlertKind::Jam))
+}
+
+fn parse_bubble(line: &str) -> Option<Event> {
+    find_ignore_ascii(line, "within a warp disruption zone")?;
+    Some(alert_event(AlertKind::Bubble))
+}
+
+fn parse_out_of_charges(line: &str) -> Option<Event> {
+    // The fitting note "not enough charges to fully load" is a different
+    // sentence and must not match.
+    find_ignore_ascii(line, "has run out of charges")?;
+    Some(alert_event(AlertKind::OutOfCharges))
+}
+
+fn parse_mining_hold(line: &str) -> Option<Event> {
+    if contains_ignore_ascii(line, "cargo hold is full")
+        || contains_ignore_ascii(line, "ore hold is full")
+    {
+        return Some(alert_event(AlertKind::CargoFull));
+    }
+    if contains_ignore_ascii(line, "beyond its mining range") {
+        return Some(alert_event(AlertKind::MiningRange));
+    }
+    None
+}
+
+fn alert_event(kind: AlertKind) -> Event {
+    Event::Alert {
+        kind,
+        text: kind.as_str().to_string(),
+    }
 }
 
 fn parse_convo(line: &str) -> Option<Event> {
@@ -624,6 +730,105 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn player_scramble_point_and_jam() {
+        let scram = ts_line(
+            r#"(combat) Warp scramble attempt from <a href="showinfo:1//2">Maes Trent [MMMMM] Jaguar</a> to you!"#,
+        );
+        match parse_line(&scram) {
+            Some(Event::Alert {
+                kind: AlertKind::Scramble,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let point = ts_line(
+            "(combat) Warp disruption attempt from Ronon Inkunen-Dex [S.UP] Gnosis to you!",
+        );
+        match parse_line(&point) {
+            Some(Event::Alert {
+                kind: AlertKind::Disrupt,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let jam =
+            ts_line("(combat) You’re jammed by SnowballB [BRG49] Scorpion - Multispectral ECM II");
+        match parse_line(&jam) {
+            Some(Event::Alert {
+                kind: AlertKind::Jam,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn npc_tackle_is_not_an_alert() {
+        let scram = ts_line("(combat) Warp scramble attempt from Sleepless Sentinel to you!");
+        assert!(parse_line(&scram).is_none());
+        let point = ts_line("(combat) Warp disruption attempt from Tetrimon Crucifier to you!");
+        assert!(parse_line(&point).is_none());
+        let jam = ts_line("(combat) Hostile Cruiser jammed - Multispectral ECM I");
+        assert!(parse_line(&jam).is_none());
+    }
+
+    #[test]
+    fn bubble_charges_and_mining() {
+        let bubble = ts_line(
+            "(notify) You are within a warp disruption zone. Get 20000.0 meters from Warp Disrupt Probe to warp.",
+        );
+        match parse_line(&bubble) {
+            Some(Event::Alert {
+                kind: AlertKind::Bubble,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let dry = ts_line("(notify) 800mm Repeating Cannon II has run out of charges");
+        match parse_line(&dry) {
+            Some(Event::Alert {
+                kind: AlertKind::OutOfCharges,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let fitting =
+            ts_line("(notify) There are not enough charges to fully load all of your modules.");
+        assert!(parse_line(&fitting).is_none());
+        let full = ts_line(
+            "(notify) Your Gas Cloud Scoop I has completed operations. Ship's cargo hold is full.",
+        );
+        match parse_line(&full) {
+            Some(Event::Alert {
+                kind: AlertKind::CargoFull,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let ore =
+            ts_line("(notify) Your Miner II has completed operations. Ship's ore hold is full.");
+        match parse_line(&ore) {
+            Some(Event::Alert {
+                kind: AlertKind::CargoFull,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let range = ts_line(
+            "(notify) Gas Cloud Scoop I deactivates without transfering ore to your cargo hold because your ship has strayed to a distance of 25000 m, beyond its mining range of 15000 m.",
+        );
+        match parse_line(&range) {
+            Some(Event::Alert {
+                kind: AlertKind::MiningRange,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        let mined = ts_line("(mining) You mined 100 units of Fullerite-C50");
+        assert!(parse_line(&mined).is_none());
     }
 
     #[test]

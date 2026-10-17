@@ -21,7 +21,10 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-use super::render::{create_text_pixmap, jetbrains_mono, marlboro, xcolor};
+use crate::alert_icon::shown_icon;
+use crate::eve_logs::AlertKind;
+
+use super::render::{create_icon_pixmap, create_text_pixmap, jetbrains_mono, marlboro, xcolor};
 use super::{
     list_window_height, DragState, MutexExt as _, PreviewManager, LIST_BORDER, LIST_ROW_FONT_PX,
     LIST_ROW_HEIGHT, LIST_ROW_LEFT_PAD, LIST_ROW_RIGHT_PAD, LIST_ROW_TOP_PAD, LIST_TEXT_BLACK,
@@ -42,6 +45,10 @@ pub(super) struct RowResources {
     pub(super) text_w: u16,
     pub(super) text_h: u16,
     pub(super) has_alert: bool,
+    pub(super) icon_pixmap: Option<u32>,
+    pub(super) icon_picture: Option<u32>,
+    pub(super) icon_w: u16,
+    pub(super) icon_h: u16,
 }
 
 /// Owns the list-view window's resources. Drop releases the row
@@ -62,9 +69,10 @@ pub(super) struct OwnedListWindow {
     /// current cycle order in `update_list_rows` to decide whether to
     /// re-rasterize the rows + resize the window.
     pub(super) last_names: Vec<String>,
-    /// `(name, label, has_alert)` as last rasterized, so a solar-system
-    /// or alert change rebuilds even when the character set didn't.
-    pub(super) last_row_sig: Vec<(String, String, bool)>,
+    /// `(name, label, alert kind, taking damage)` as last rasterized, so
+    /// a solar-system, alert, or damage-flash change rebuilds even when
+    /// the character set didn't.
+    pub(super) last_row_sig: Vec<(String, String, Option<AlertKind>, bool)>,
     pub(super) width: u16,
     pub(super) height: u16,
     pub(super) x: i16,
@@ -85,6 +93,12 @@ impl Drop for OwnedListWindow {
             let _ = self.conn.free_pixmap(row.red_pixmap);
             let _ = self.conn.free_pixmap(row.black_pixmap);
             let _ = self.conn.free_pixmap(row.gold_pixmap);
+            if let Some(pic) = row.icon_picture {
+                let _ = self.conn.render_free_picture(pic);
+            }
+            if let Some(pix) = row.icon_pixmap {
+                let _ = self.conn.free_pixmap(pix);
+            }
         }
         let _ = self.conn.render_free_picture(self.dst_picture);
         let _ = self.conn.render_free_picture(self.title_picture);
@@ -239,13 +253,13 @@ impl PreviewManager {
             .map(|w| w.title)
             .collect();
 
-        let (enabled, show_system) = {
+        let (enabled, show_system, clear) = {
             let logs = self.logs_config.lock_recover();
-            (logs.enabled, logs.show_system)
+            (logs.enabled, logs.show_system, logs.alert_clear)
         };
         let now = Instant::now();
         let live = self.log_live.lock_recover();
-        let row_sig: Vec<(String, String, bool)> = names
+        let row_sig: Vec<(String, String, Option<AlertKind>, bool)> = names
             .iter()
             .map(|name| {
                 let system = if enabled && show_system {
@@ -254,8 +268,13 @@ impl PreviewManager {
                     None
                 };
                 let label = crate::preview_common::title_label(name, system);
-                let has_alert = enabled && live.alert_for(name, now).is_some();
-                (name.clone(), label, has_alert)
+                let kind = if enabled {
+                    live.alert_for(name, now, clear).map(|a| a.kind)
+                } else {
+                    None
+                };
+                let taking = enabled && live.taking_damage(name, now);
+                (name.clone(), label, kind, taking)
             })
             .collect();
         drop(live);
@@ -286,11 +305,18 @@ impl PreviewManager {
             let _ = self.conn.free_pixmap(row.red_pixmap);
             let _ = self.conn.free_pixmap(row.black_pixmap);
             let _ = self.conn.free_pixmap(row.gold_pixmap);
+            if let Some(pic) = row.icon_picture {
+                let _ = self.conn.render_free_picture(pic);
+            }
+            if let Some(pix) = row.icon_pixmap {
+                let _ = self.conn.free_pixmap(pix);
+            }
         }
 
         let parent = self.list_window.as_ref().unwrap().window;
         let mut new_rows = HashMap::new();
-        for (name, label, has_alert) in &row_sig {
+        let icon_px = (LIST_ROW_HEIGHT as i32 - 6).max(8);
+        for (name, label, kind, taking) in &row_sig {
             // Active marker: black-right-pointing-small-triangle. The
             // Windows manager uses 🚬 (cigarette emoji) which JetBrains
             // Mono doesn't ship a glyph for; ▸ keeps a single bundled
@@ -324,6 +350,14 @@ impl PreviewManager {
                 LIST_ROW_FONT_PX,
                 self.argb32_format,
             )?;
+            let (icon_pixmap, icon_picture, icon_w, icon_h) =
+                if let Some(icon) = shown_icon(*taking, *kind) {
+                    let (pixmap, picture, w, h) =
+                        create_icon_pixmap(&self.conn, parent, icon, icon_px, self.argb32_format)?;
+                    (Some(pixmap), Some(picture), w, h)
+                } else {
+                    (None, None, 0, 0)
+                };
             new_rows.insert(
                 name.clone(),
                 RowResources {
@@ -335,7 +369,11 @@ impl PreviewManager {
                     gold_picture,
                     text_w,
                     text_h,
-                    has_alert: *has_alert,
+                    has_alert: kind.is_some(),
+                    icon_pixmap,
+                    icon_picture,
+                    icon_w,
+                    icon_h,
                 },
             );
         }
@@ -433,12 +471,20 @@ impl PreviewManager {
         // bakes leading into the rasterized image height) which gives
         // even visual spacing between rows. Truncate composite width
         // so long character names don't bleed past the right edge.
-        let max_text_w =
-            (list.width as i16 - LIST_BORDER as i16 * 2 - LIST_ROW_LEFT_PAD - LIST_ROW_RIGHT_PAD)
-                .max(0) as u16;
         let mut row_top = LIST_BORDER as i16 + LIST_TITLE_STRIP_HEIGHT as i16 + LIST_ROW_TOP_PAD;
         for name in &list.last_names {
             if let Some(row) = list.rows.get(name) {
+                let icon_reserve = if row.icon_picture.is_some() {
+                    row.icon_w as i16 + 4
+                } else {
+                    0
+                };
+                let max_text_w = (list.width as i16
+                    - LIST_BORDER as i16 * 2
+                    - LIST_ROW_LEFT_PAD
+                    - LIST_ROW_RIGHT_PAD
+                    - icon_reserve)
+                    .max(0) as u16;
                 let is_active = self
                     .active_character
                     .as_ref()
@@ -469,6 +515,27 @@ impl PreviewManager {
                     composite_w,
                     row.text_h,
                 )?;
+                if let Some(picture) = row.icon_picture {
+                    let icon_x = list.width as i16
+                        - LIST_BORDER as i16
+                        - LIST_ROW_RIGHT_PAD
+                        - row.icon_w as i16;
+                    let icon_y = row_top + (LIST_ROW_HEIGHT as i16 - row.icon_h as i16) / 2;
+                    conn.render_composite(
+                        PictOp::OVER,
+                        picture,
+                        x11rb::NONE,
+                        list.dst_picture,
+                        0,
+                        0,
+                        0,
+                        0,
+                        icon_x.max(0),
+                        icon_y.max(0),
+                        row.icon_w,
+                        row.icon_h,
+                    )?;
+                }
             }
             row_top += LIST_ROW_HEIGHT as i16;
         }

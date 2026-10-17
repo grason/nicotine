@@ -7,6 +7,7 @@
 // GUI-first; the daemon subcommand still works, it just runs headless.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod alert_icon;
 mod audio;
 mod config;
 mod config_panel;

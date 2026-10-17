@@ -21,13 +21,16 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
+use crate::alert_icon::{alert_icon_px, shown_icon};
+use crate::eve_logs::AlertKind;
 use crate::preview_common::{
     fit_contain, grid_layout, grid_thumb_bounds, overlay_label_bands, preview_should_hide,
     GridCell, GridRect, GRID_GAP_PX, GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX, HALO_PAD,
 };
 
 use super::render::{
-    apply_scale_transform, create_halo_text_pixmap, jetbrains_mono, pick_visual_format, xcolor,
+    apply_scale_transform, create_halo_text_pixmap, create_icon_pixmap, jetbrains_mono,
+    pick_visual_format, xcolor,
 };
 use super::{
     opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, CHROME_DARK, NICOTINE_CREAM,
@@ -46,7 +49,10 @@ struct PaintSnap {
     text_h: u16,
     is_active: bool,
     taking_damage: bool,
-    label_is_alert: bool,
+    alert_kind: Option<AlertKind>,
+    icon_picture: Option<u32>,
+    icon_w: u16,
+    icon_h: u16,
 }
 
 /// One redirected EVE client inside the grid. Drop unredirects the
@@ -64,7 +70,12 @@ struct GridSource {
     /// sets this so only the client that drew pays for a round-trip.
     fresh: bool,
     label: String,
-    label_is_alert: bool,
+    alert_kind: Option<AlertKind>,
+    icon_pixmap: Option<u32>,
+    icon_picture: Option<u32>,
+    icon_w: u16,
+    icon_h: u16,
+    icon_px: i32,
     text_pixmap: u32,
     text_picture: u32,
     text_w: u16,
@@ -80,6 +91,12 @@ impl Drop for GridSource {
         let _ = self.conn.render_free_picture(self.src_picture);
         let _ = self.conn.render_free_picture(self.text_picture);
         let _ = self.conn.free_pixmap(self.text_pixmap);
+        if let Some(pic) = self.icon_picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = self.icon_pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
         let _ = self.conn.free_pixmap(self.src_pixmap);
         let _ = self
             .conn
@@ -91,7 +108,7 @@ impl Drop for GridSource {
 /// still matches, so a quiet grid does not repaint at 10 Hz.
 #[derive(PartialEq, Eq)]
 struct GridChrome {
-    entries: Vec<(String, String, bool, bool, bool, bool)>,
+    entries: Vec<(String, String, bool, Option<AlertKind>, bool, bool)>,
     columns: u32,
     cell_w: u32,
     width: u16,
@@ -385,7 +402,12 @@ impl PreviewManager {
             source_h: geom.height,
             fresh: false,
             label: title.to_string(),
-            label_is_alert: false,
+            alert_kind: None,
+            icon_pixmap: None,
+            icon_picture: None,
+            icon_w: 0,
+            icon_h: 0,
+            icon_px: 0,
             text_pixmap,
             text_picture,
             text_w,
@@ -425,6 +447,14 @@ impl PreviewManager {
         let layout = grid_layout(count, columns, cell_w, GRID_GAP_PX, GRID_OUTER_BORDER_PX);
         let width = layout.window_w.max(1) as u16;
         let height = layout.window_h.max(1) as u16;
+        let icon_px = layout
+            .cells
+            .first()
+            .map(|cell| {
+                let bounds = grid_thumb_bounds(*cell, layout.cell_inset);
+                alert_icon_px(bounds.w.min(bounds.h), 1.0)
+            })
+            .unwrap_or(16);
         let size_changed = cur_w != width || cur_h != height;
         if size_changed {
             let _ = self.conn.configure_window(
@@ -446,9 +476,12 @@ impl PreviewManager {
             .map(|g| g.sources.iter().map(|s| s.character_name.clone()).collect())
             .unwrap_or_default();
         let now = Instant::now();
-        let enabled = self.logs_config.lock_recover().enabled;
+        let (enabled, clear) = {
+            let logs = self.logs_config.lock_recover();
+            (logs.enabled, logs.alert_clear)
+        };
         for name in &names {
-            let (is_active, alert, taking) = {
+            let (is_active, kind, taking) = {
                 let is_active = self
                     .active_character
                     .as_ref()
@@ -458,32 +491,28 @@ impl PreviewManager {
                             .iter()
                             .any(|s| s.character_name == *name && s.source_id == self.active_id)
                     });
-                let (alert, taking) = if enabled && !is_active {
+                let (kind, taking) = if enabled {
                     let live = self.log_live.lock_recover();
                     (
-                        live.alert_for(name, now).map(|a| a.text.clone()),
+                        live.alert_for(name, now, clear).map(|a| a.kind),
                         live.taking_damage(name, now),
                     )
-                } else if enabled {
-                    let live = self.log_live.lock_recover();
-                    (None, live.taking_damage(name, now))
                 } else {
                     (None, false)
                 };
-                (is_active, alert, taking)
+                (is_active, kind, taking)
             };
-            let label_is_alert = alert.is_some();
-            let label = alert.unwrap_or_else(|| name.clone());
             let hide_thumb = preview_should_hide(hide_active, is_active);
             let needs_text = self.grid_window.as_ref().is_some_and(|g| {
-                g.sources.iter().any(|s| {
-                    s.character_name == *name
-                        && (s.label != label || s.label_is_alert != label_is_alert)
-                })
+                g.sources
+                    .iter()
+                    .any(|s| s.character_name == *name && s.label != *name)
             });
             if needs_text {
-                self.rebuild_grid_label(name, &label, label_is_alert)?;
+                self.rebuild_grid_label(name, name)?;
             }
+            // sync reads the stored flash flag, so assign taking_damage after.
+            self.sync_grid_icon(name, kind, taking, icon_px)?;
             if let Some(grid) = self.grid_window.as_mut() {
                 if let Some(src) = grid.sources.iter_mut().find(|s| s.character_name == *name) {
                     src.is_active = is_active;
@@ -518,7 +547,7 @@ impl PreviewManager {
                         s.character_name.clone(),
                         s.label.clone(),
                         s.is_active,
-                        s.label_is_alert,
+                        s.alert_kind,
                         s.taking_damage,
                         s.hide_thumb,
                     )
@@ -531,21 +560,16 @@ impl PreviewManager {
         })
     }
 
-    fn rebuild_grid_label(&mut self, name: &str, label: &str, is_alert: bool) -> Result<()> {
+    fn rebuild_grid_label(&mut self, name: &str, label: &str) -> Result<()> {
         let window = match self.grid_window.as_ref().map(|g| g.window) {
             Some(w) => w,
             None => return Ok(()),
-        };
-        let color = if is_alert {
-            NICOTINE_GOLD
-        } else {
-            NICOTINE_CREAM
         };
         let (pixmap, picture, w, h) = create_halo_text_pixmap(
             &self.conn,
             window,
             label,
-            color,
+            NICOTINE_CREAM,
             jetbrains_mono(),
             GRID_NAME_FONT_PX,
             self.argb32_format,
@@ -573,8 +597,91 @@ impl PreviewManager {
             src.text_w = w;
             src.text_h = h;
             src.label = label.to_string();
-            src.label_is_alert = is_alert;
         }
+        Ok(())
+    }
+
+    fn sync_grid_icon(
+        &mut self,
+        name: &str,
+        kind: Option<AlertKind>,
+        taking: bool,
+        icon_px: i32,
+    ) -> Result<()> {
+        let (needs, window) = {
+            let Some(grid) = self.grid_window.as_ref() else {
+                return Ok(());
+            };
+            let Some(src) = grid.sources.iter().find(|s| s.character_name == name) else {
+                return Ok(());
+            };
+            let have = shown_icon(src.taking_damage, src.alert_kind);
+            let want = shown_icon(taking, kind);
+            let needs = have != want || (want.is_some() && src.icon_px != icon_px);
+            (needs, grid.window)
+        };
+        if !needs {
+            // The event can change while swords stay up. Keep the stored
+            // kind current so the gold frame is right when the flash ends.
+            if let Some(src) = self
+                .grid_window
+                .as_mut()
+                .and_then(|g| g.sources.iter_mut().find(|s| s.character_name == name))
+            {
+                src.alert_kind = kind;
+            }
+            return Ok(());
+        }
+        let new = if let Some(icon) = shown_icon(taking, kind) {
+            let (pixmap, picture, w, h) =
+                create_icon_pixmap(&self.conn, window, icon, icon_px, self.argb32_format)?;
+            Some((pixmap, picture, w, h, icon_px))
+        } else {
+            None
+        };
+        let old = {
+            let Some(src) = self
+                .grid_window
+                .as_mut()
+                .and_then(|g| g.sources.iter_mut().find(|s| s.character_name == name))
+            else {
+                if let Some((pixmap, picture, _, _, _)) = new {
+                    let _ = self.conn.render_free_picture(picture);
+                    let _ = self.conn.free_pixmap(pixmap);
+                }
+                return Ok(());
+            };
+            (src.icon_picture.take(), src.icon_pixmap.take())
+        };
+        if let Some(pic) = old.0 {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = old.1 {
+            let _ = self.conn.free_pixmap(pix);
+        }
+        let Some(src) = self
+            .grid_window
+            .as_mut()
+            .and_then(|g| g.sources.iter_mut().find(|s| s.character_name == name))
+        else {
+            if let Some((pixmap, picture, _, _, _)) = new {
+                let _ = self.conn.render_free_picture(picture);
+                let _ = self.conn.free_pixmap(pixmap);
+            }
+            return Ok(());
+        };
+        if let Some((pixmap, picture, w, h, px)) = new {
+            src.icon_pixmap = Some(pixmap);
+            src.icon_picture = Some(picture);
+            src.icon_w = w;
+            src.icon_h = h;
+            src.icon_px = px;
+        } else {
+            src.icon_w = 0;
+            src.icon_h = 0;
+            src.icon_px = 0;
+        }
+        src.alert_kind = kind;
         Ok(())
     }
 
@@ -619,7 +726,10 @@ impl PreviewManager {
                     text_h: src.text_h,
                     is_active: src.is_active,
                     taking_damage: src.taking_damage,
-                    label_is_alert: src.label_is_alert,
+                    alert_kind: src.alert_kind,
+                    icon_picture: src.icon_picture,
+                    icon_w: src.icon_w,
+                    icon_h: src.icon_h,
                 })
                 .collect();
             (grid.dst_picture, grid.width, grid.height, cells)
@@ -689,9 +799,9 @@ impl PreviewManager {
                 )?;
             }
 
-            // Name (or the gold alert) sits on the picture. Hide-active
-            // skips the mirror above and still draws the label on the
-            // dark cell fill. The frame below covers any halo spill.
+            // Name sits on the picture. The alert icon is centered on the
+            // cell, including a hide-active slot that stays dark. The
+            // frame below covers any halo spill.
             let band = overlay_label_bands(
                 GridRect {
                     x: cell.x,
@@ -735,9 +845,31 @@ impl PreviewManager {
                 )?;
             }
 
+            if let Some(picture) = src.icon_picture {
+                let bounds = grid_thumb_bounds(cell, layout.cell_inset);
+                let tx = bounds.x + (bounds.w - src.icon_w as i32) / 2;
+                let ty = bounds.y + (bounds.h - src.icon_h as i32) / 2;
+                if src.icon_w > 0 && src.icon_h > 0 {
+                    self.conn.render_composite(
+                        PictOp::OVER,
+                        picture,
+                        x11rb::NONE,
+                        dst,
+                        0,
+                        0,
+                        0,
+                        0,
+                        tx as i16,
+                        ty as i16,
+                        src.icon_w,
+                        src.icon_h,
+                    )?;
+                }
+            }
+
             let frame = if src.is_active || src.taking_damage {
                 Some(red)
-            } else if src.label_is_alert {
+            } else if src.alert_kind.is_some() {
                 Some(gold)
             } else {
                 None

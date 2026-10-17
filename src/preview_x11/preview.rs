@@ -28,9 +28,9 @@ use super::render::{
     thumbnail_size, xcolor,
 };
 use super::{
-    opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, ALERT_BANNER_HEIGHT,
-    BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_RED, PREVIEW_HEIGHT,
-    PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
+    opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, BORDER_WIDTH, CHROME_DARK,
+    NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH, TITLE_FONT_PX,
+    TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
 };
 
 fn composite_over(
@@ -100,13 +100,17 @@ pub(super) struct OwnedPreview {
     /// Last title-strip label we rasterized (`Name` or `Name - Jita`).
     /// Rebuilt when the solar system changes.
     pub(super) title_label: String,
-    /// Live alert label, if any. Drawn on the thumbnail; it does not
-    /// change the destination rect.
-    pub(super) alert_text: Option<String>,
+    /// Icon centered on the thumbnail. `alert_kind` is the live event
+    /// (gold chrome). The pixmap is crossed swords while
+    /// `taking_damage` is set, otherwise that event. The bitmap includes
+    /// a 1px transparent pad. `icon_px` is the glyph size it was drawn
+    /// at, so a resize rebuilds it.
+    pub(super) alert_kind: Option<crate::eve_logs::AlertKind>,
     pub(super) alert_pixmap: Option<u32>,
     pub(super) alert_picture: Option<u32>,
-    pub(super) alert_text_w: u16,
-    pub(super) alert_text_h: u16,
+    pub(super) icon_w: u16,
+    pub(super) icon_h: u16,
+    pub(super) icon_px: i32,
     /// Quiet DPS meter under the name strip. Hidden when both rates
     /// are idle. Labels are the last formatted strings we rasterized.
     pub(super) showing_dps: bool,
@@ -430,11 +434,12 @@ impl PreviewManager {
             title_text_w,
             title_text_h,
             title_label: title.to_string(),
-            alert_text: None,
+            alert_kind: None,
             alert_pixmap: None,
             alert_picture: None,
-            alert_text_w: 0,
-            alert_text_h: 0,
+            icon_w: 0,
+            icon_h: 0,
+            icon_px: 0,
             showing_dps: false,
             dps_in_label: String::new(),
             dps_out_label: String::new(),
@@ -512,7 +517,7 @@ impl PreviewManager {
 
         self.paint_preview_labels(preview)?;
 
-        let has_alert = preview.alert_text.is_some() && !preview.is_active;
+        let has_alert = preview.alert_kind.is_some() && !preview.is_active;
         let chrome_color = xcolor(
             if preview.is_active || preview.taking_damage {
                 NICOTINE_RED
@@ -554,9 +559,10 @@ impl PreviewManager {
         Ok(())
     }
 
-    /// Name and DPS across the top of the picture, alert across the
-    /// bottom. Pixmaps include [`HALO_PAD`], so centering the returned
-    /// size keeps glyphs centered and left/right alignment subtracts the pad.
+    /// Name and DPS across the top of the picture. The alert icon is
+    /// centered on the thumbnail. Pixmaps include [`HALO_PAD`], so
+    /// centering the returned size keeps glyphs centered and left/right
+    /// alignment subtracts the pad.
     fn paint_preview_labels(&self, preview: &OwnedPreview) -> Result<()> {
         let bands = overlay_label_bands(
             GridRect {
@@ -567,7 +573,7 @@ impl PreviewManager {
             },
             BORDER_WIDTH as i32,
             TITLE_STRIP_HEIGHT as i32,
-            ALERT_BANNER_HEIGHT as i32,
+            0,
             DPS_SLOT_PX,
         );
         let dst = preview.render_picture;
@@ -613,20 +619,22 @@ impl PreviewManager {
             }
         }
 
-        if let (Some(_text), Some(alert_picture)) =
-            (preview.alert_text.as_ref(), preview.alert_picture)
-        {
-            let tx = bands.bottom.x + TITLE_TEXT_LEFT_PAD as i32 - HALO_PAD;
-            let ty = bands.bottom.y + (bands.bottom.h - preview.alert_text_h as i32) / 2;
-            let max_w = (bands.bottom.w - TITLE_TEXT_LEFT_PAD as i32 + HALO_PAD * 2).max(0) as u16;
+        if let Some(alert_picture) = preview.alert_picture {
+            let (left, top, right, bottom) = thumbnail_dest(
+                preview.width as i32,
+                preview.height as i32,
+                BORDER_WIDTH as i32,
+            );
+            let tx = left + (right - left - preview.icon_w as i32) / 2;
+            let ty = top + (bottom - top - preview.icon_h as i32) / 2;
             composite_over(
                 &self.conn,
                 alert_picture,
                 dst,
                 tx,
                 ty,
-                preview.alert_text_w.min(max_w),
-                preview.alert_text_h,
+                preview.icon_w,
+                preview.icon_h,
             )?;
         }
         Ok(())

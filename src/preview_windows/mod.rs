@@ -1,9 +1,10 @@
-use crate::config::{Config, LiveSettings, LogsConfig};
+use crate::alert_icon::{raster_icon, shown_icon};
+use crate::config::{AlertClear, Config, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
-use crate::eve_logs::LogLiveState;
+use crate::eve_logs::{AlertKind, LogLiveState};
 use crate::preview_common::{
     dps_in_label, dps_out_label, preview_should_hide, snap_position, thumbnail_dest, title_label,
-    DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    DragRect, DragState, DRAG_THRESHOLD_PX, HALO_PAD, SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -191,9 +192,10 @@ struct PreviewWindowState {
     is_active: bool,
     /// Last title-strip label (`Name` or `Name - Jita`).
     title_label: String,
-    /// Live alert label. Drawn on the text layer; it does not change the
-    /// DWM destination.
-    alert_text: Option<String>,
+    /// Live alert. Gold chrome when set on an inactive client. The
+    /// centered icon is crossed swords while `taking_damage` is set.
+    /// It does not change the DWM destination.
+    alert_kind: Option<AlertKind>,
     showing_dps: bool,
     dps_in_label: String,
     dps_out_label: String,
@@ -273,9 +275,9 @@ struct PreviewManager {
     /// InvalidateRect every 100ms otherwise produces a visible flicker
     /// and feels sluggish.
     list_last_names: Vec<String>,
-    /// `(name, label, has_alert)` last painted, so a system/alert change
-    /// invalidates even when the character set didn't.
-    list_last_rows: Vec<(String, String, bool, bool)>,
+    /// `(name, label, alert kind, taking damage)` last painted, so a
+    /// system or icon change invalidates even when the character set didn't.
+    list_last_rows: Vec<(String, String, Option<AlertKind>, bool)>,
 }
 
 /// Drop-guard for the list window — destroys the Win32 window and the
@@ -414,14 +416,15 @@ impl PreviewManager {
                             (String::new(), Vec::new(), true)
                         } else {
                             let state = &*ptr;
-                            let alert = state.alert_text.as_deref().unwrap_or("");
+                            let alert = state.alert_kind.map(|k| k.as_str()).unwrap_or("");
                             let key = format!(
-                                "{}|{}|{}|{}|{}|{w}|{h}|{opacity}",
+                                "{}|{}|{}|{}|{}|{}|{w}|{h}|{opacity}",
                                 state.title_label,
                                 state.showing_dps,
                                 state.dps_in_label,
                                 state.dps_out_label,
-                                alert
+                                alert,
+                                state.taking_damage
                             );
                             let fresh = preview.overlay.matches(&key);
                             let pixels = if fresh {
@@ -732,21 +735,21 @@ impl PreviewManager {
         }
     }
 
-    /// Push solar-system titles and alert banners from the log tailer
-    /// onto preview chrome / list rows. Drops the focused client's alert
-    /// when `alerts_on_inactive_only` is on.
+    /// Push solar-system titles and alert icons from the log tailer
+    /// onto preview chrome / list rows. Drops the focused client's
+    /// alert when the clear mode says to.
     fn apply_log_chrome(&mut self) {
-        let (enabled, show_system, show_dps, inactive_only) = {
+        let (enabled, show_system, show_dps, clear) = {
             let logs = self.logs_config.lock().unwrap();
             (
                 logs.enabled,
                 logs.show_system,
                 logs.show_dps,
-                logs.alerts_on_inactive_only,
+                logs.alert_clear,
             )
         };
         let now = Instant::now();
-        if enabled && inactive_only {
+        if enabled {
             self.drop_focused_alert();
         }
 
@@ -758,7 +761,7 @@ impl PreviewManager {
                 } else {
                     None
                 };
-                let alert = live.alert_for(name, now).map(|a| a.text.clone());
+                let alert = live.alert_for(name, now, clear).map(|a| a.kind);
                 let dps = if show_dps { live.dps_for(name) } else { None };
                 let taking = live.taking_damage(name, now);
                 (system, alert, dps, taking)
@@ -778,13 +781,13 @@ impl PreviewManager {
                     continue;
                 }
                 let changed = (*ptr).title_label != label
-                    || (*ptr).alert_text != alert
+                    || (*ptr).alert_kind != alert
                     || (*ptr).showing_dps != want_dps
                     || (*ptr).dps_in_label != in_l
                     || (*ptr).dps_out_label != out_l
                     || (*ptr).taking_damage != taking;
                 (*ptr).title_label = label;
-                (*ptr).alert_text = alert;
+                (*ptr).alert_kind = alert;
                 (*ptr).showing_dps = want_dps;
                 (*ptr).dps_in_label = in_l;
                 (*ptr).dps_out_label = out_l;
@@ -796,7 +799,7 @@ impl PreviewManager {
         }
 
         if self.list.is_some() {
-            let rows = self.list_row_sig(enabled, show_system, now);
+            let rows = self.list_row_sig(enabled, show_system, clear, now);
             if rows != self.list_last_rows {
                 self.list_last_rows = rows;
                 if let Some(list) = &self.list {
@@ -818,13 +821,15 @@ impl PreviewManager {
         }
     }
 
-    /// Clear the focused client's alert when inactive-only alerts are on.
-    /// List and grid mode do not keep `self.previews`, so the name comes
-    /// from the cycle list. No-op when the setting is off.
+    /// Clear the focused client's alert. Inactive-only does this so the
+    /// icon is not shown on the client you are playing. Keep-until-switch
+    /// does it even when that checkbox is off, or the icon would never
+    /// leave the window you are already on.
     fn drop_focused_alert(&mut self) {
         let should_drop = {
             let logs = self.logs_config.lock().unwrap();
-            logs.enabled && logs.alerts_on_inactive_only
+            logs.enabled
+                && (logs.alerts_on_inactive_only || logs.alert_clear == AlertClear::UntilFocus)
         };
         if !should_drop {
             return;
@@ -846,8 +851,9 @@ impl PreviewManager {
         &self,
         enabled: bool,
         show_system: bool,
+        clear: AlertClear,
         now: Instant,
-    ) -> Vec<(String, String, bool, bool)> {
+    ) -> Vec<(String, String, Option<AlertKind>, bool)> {
         let names: Vec<String> = {
             let s = self.state.lock().unwrap();
             s.get_ordered_windows()
@@ -865,9 +871,13 @@ impl PreviewManager {
                     None
                 };
                 let label = title_label(&name, system);
-                let has_alert = enabled && live.alert_for(&name, now).is_some();
+                let kind = if enabled {
+                    live.alert_for(&name, now, clear).map(|a| a.kind)
+                } else {
+                    None
+                };
                 let taking = enabled && live.taking_damage(&name, now);
-                (name, label, has_alert, taking)
+                (name, label, kind, taking)
             })
             .collect()
     }
@@ -934,7 +944,7 @@ impl PreviewManager {
         if self.active_id != active_id {
             self.active_id = active_id;
             // Consume the alert before the repaint. Otherwise a fast
-            // cycle away brings the banner back on a client the user
+            // cycle away brings the icon back on a client the user
             // already looked at.
             self.drop_focused_alert();
             if let Some(list) = &self.list {
@@ -1021,7 +1031,7 @@ impl PreviewManager {
             drag: DragState::default(),
             is_active: false,
             title_label: window.title.clone(),
-            alert_text: None,
+            alert_kind: None,
             showing_dps: false,
             dps_in_label: String::new(),
             dps_out_label: String::new(),
@@ -1318,7 +1328,7 @@ unsafe fn paint_chrome(hwnd: HWND, state: &PreviewWindowState) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
 
-    let has_alert = state.alert_text.is_some() && !state.is_active;
+    let has_alert = state.alert_kind.is_some() && !state.is_active;
     let chrome_color = if state.is_active || state.taking_damage {
         NICOTINE_RED
     } else if has_alert {
@@ -1544,50 +1554,70 @@ unsafe fn paint_list(hwnd: HWND) {
     let prev_row_font = SelectObject(hdc, body_font.into());
     let left_pad = px(10);
     let right_pad = px(6);
+    let icon_px = (row_h - px(6)).max(px(8));
+    let now = Instant::now();
+    let painted: Vec<(String, COLORREF, Option<AlertKind>, bool)> = {
+        let (enabled, show_system, clear) = {
+            let logs = mgr.logs_config.lock().unwrap();
+            (logs.enabled, logs.show_system, logs.alert_clear)
+        };
+        let live = mgr.log_live.lock().unwrap();
+        windows
+            .iter()
+            .map(|window| {
+                let is_active = window.id == active_id;
+                let system = if enabled && show_system {
+                    live.system_for(&window.title)
+                } else {
+                    None
+                };
+                let label = title_label(&window.title, system);
+                let kind = if enabled {
+                    live.alert_for(&window.title, now, clear).map(|a| a.kind)
+                } else {
+                    None
+                };
+                let taking = enabled && live.taking_damage(&window.title, now);
+                let text = if is_active {
+                    format!("🚬 {label}")
+                } else {
+                    format!("     {label}")
+                };
+                let color = if is_active || taking {
+                    NICOTINE_RED
+                } else if kind.is_some() {
+                    NICOTINE_GOLD
+                } else {
+                    LIST_TEXT_BLACK
+                };
+                (text, color, kind, taking)
+            })
+            .collect()
+    };
     let mut y = title_h + px(2);
-    for window in &windows {
-        let is_active = window.id == active_id;
-        let (label, has_alert) = {
-            let (enabled, show_system) = {
-                let logs = mgr.logs_config.lock().unwrap();
-                (logs.enabled, logs.show_system)
-            };
-            let live = mgr.log_live.lock().unwrap();
-            let system = if enabled && show_system {
-                live.system_for(&window.title)
-            } else {
-                None
-            };
-            let label = title_label(&window.title, system);
-            let has_alert = enabled && live.alert_for(&window.title, Instant::now()).is_some();
-            (label, has_alert)
-        };
-        let text = if is_active {
-            format!("🚬 {label}")
-        } else {
-            format!("     {label}")
-        };
-        let taking = mgr
-            .log_live
-            .lock()
-            .unwrap()
-            .taking_damage(&window.title, Instant::now());
-        let color = if is_active || taking {
-            NICOTINE_RED
-        } else if has_alert {
-            NICOTINE_GOLD
-        } else {
-            LIST_TEXT_BLACK
-        };
+    for (text, color, kind, taking) in painted {
         let _ = SetTextColor(hdc, color);
         let mut row_buf: Vec<u16> = text.encode_utf16().collect();
+        let shown = shown_icon(taking, kind);
+        let icon_reserve = if shown.is_some() {
+            icon_px + HALO_PAD * 2 + px(4)
+        } else {
+            0
+        };
         let mut row_rect = RECT {
             left: left_pad,
             top: y,
-            right: width - right_pad,
+            right: width - right_pad - icon_reserve,
             bottom: y + row_h,
         };
         let _ = DrawTextW(hdc, &mut row_buf, &mut row_rect, DT_SINGLELINE | DT_VCENTER);
+        if let Some(icon) = shown {
+            let raster = raster_icon(icon, icon_px);
+            let side = icon_px + HALO_PAD * 2;
+            let x = width - right_pad - side;
+            let icon_y = y + (row_h - side) / 2;
+            overlay::blit_premul(hdc, x, icon_y, &raster, side, side);
+        }
         y += row_h;
     }
     SelectObject(hdc, prev_row_font);

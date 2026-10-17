@@ -205,15 +205,20 @@ pub struct LogsConfig {
     #[serde(default = "default_true")]
     pub show_system: bool,
     /// Thin incoming/outgoing DPS row under the preview title. Off the
-    /// alert banner on purpose — combat ticks are too frequent to flash.
+    /// alert icon on purpose — combat ticks are too frequent to flash.
     #[serde(default = "default_true")]
     pub show_dps: bool,
     /// Drop / clear alerts for the currently-focused EVE client.
     #[serde(default = "default_true")]
     pub alerts_on_inactive_only: bool,
-    /// How long an alert banner stays up, in seconds.
+    /// How long an alert icon stays up, in seconds, when
+    /// [`alert_clear`](Self::alert_clear) is [`AlertClear::Timeout`].
     #[serde(default = "default_alert_secs")]
     pub alert_secs: u32,
+    /// Whether an icon waits for you to switch to that client, or
+    /// expires after [`alert_secs`](Self::alert_secs).
+    #[serde(default)]
+    pub alert_clear: AlertClear,
     /// Play the embedded alert beep when an enabled alert fires.
     #[serde(default)]
     pub alert_sound: bool,
@@ -231,6 +236,7 @@ impl Default for LogsConfig {
             show_dps: true,
             alerts_on_inactive_only: true,
             alert_secs: default_alert_secs(),
+            alert_clear: AlertClear::UntilFocus,
             alert_sound: false,
             alerts: AlertToggles::default(),
         }
@@ -255,6 +261,25 @@ pub struct AlertToggles {
     pub convo_request: bool,
     #[serde(default)]
     pub crystal_broke: bool,
+    /// Player scram, point, jam, and warp-disruption bubbles.
+    #[serde(default = "default_true")]
+    pub tackle: bool,
+    #[serde(default = "default_true")]
+    pub out_of_charges: bool,
+    /// Cargo or ore hold full, and a miner that left range.
+    #[serde(default = "default_true")]
+    pub mining: bool,
+}
+
+/// How an alert icon leaves the thumbnail.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertClear {
+    /// Stay until that EVE client is activated.
+    #[default]
+    UntilFocus,
+    /// Expire after [`LogsConfig::alert_secs`].
+    Timeout,
 }
 
 impl Default for AlertToggles {
@@ -267,6 +292,9 @@ impl Default for AlertToggles {
             decloak: false,
             convo_request: false,
             crystal_broke: false,
+            tackle: true,
+            out_of_charges: true,
+            mining: true,
         }
     }
 }
@@ -748,7 +776,11 @@ eve_height = 1080
         assert!(parsed.logs.show_dps);
         assert!(parsed.logs.alerts.fleet_invite);
         assert!(!parsed.logs.alerts.decloak);
+        assert!(parsed.logs.alerts.tackle);
+        assert!(parsed.logs.alerts.out_of_charges);
+        assert!(parsed.logs.alerts.mining);
         assert_eq!(parsed.logs.alert_secs, 8);
+        assert_eq!(parsed.logs.alert_clear, AlertClear::UntilFocus);
         assert_eq!(parsed.display_mode, DisplayMode::Previews);
         assert_eq!(parsed.grid_columns, 2);
         assert_eq!(parsed.grid_cell_width, 160);
@@ -786,6 +818,8 @@ grid_cell_width = 128
                 ..AlertToggles::default()
             },
             alert_sound: true,
+            alert_clear: AlertClear::Timeout,
+            alert_secs: 12,
             ..LogsConfig::default()
         };
         let config = Config {
@@ -829,5 +863,8 @@ grid_cell_width = 128
         assert_eq!(deserialized.logs.chatlog_dir, "/tmp/chat");
         assert!(deserialized.logs.alerts.decloak);
         assert!(deserialized.logs.alert_sound);
+        assert_eq!(deserialized.logs.alert_clear, AlertClear::Timeout);
+        assert_eq!(deserialized.logs.alert_secs, 12);
+        assert!(deserialized.logs.alerts.tackle);
     }
 }

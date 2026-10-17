@@ -249,6 +249,22 @@ pub(super) fn create_halo_text_pixmap(
     Ok((pixmap, picture, out_w, out_h))
 }
 
+/// Alert or damage icon. The returned side includes the transparent
+/// pad, so centering that side centers the glyph.
+pub(super) fn create_icon_pixmap(
+    conn: &RustConnection,
+    parent_drawable: Window,
+    icon: crate::alert_icon::ShownIcon,
+    size: i32,
+    argb32_format: u32,
+) -> Result<(u32, u32, u16, u16)> {
+    let bgra = crate::alert_icon::raster_icon(icon, size);
+    let side = (size.max(1) + HALO_PAD * 2).max(1) as u16;
+    let (pixmap, picture) =
+        upload_bgra_pixmap(conn, parent_drawable, &bgra, side, side, argb32_format)?;
+    Ok((pixmap, picture, side, side))
+}
+
 fn upload_bgra_pixmap(
     conn: &RustConnection,
     parent_drawable: Window,

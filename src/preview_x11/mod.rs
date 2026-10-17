@@ -4,7 +4,7 @@
 // mirror via XComposite redirect + XRender server-side composite. Chrome:
 //   - 3px frame. Nicotine red when the source is focused or taking
 //     damage, gold when an inactive client has a live alert, dark otherwise
-//   - Name, DPS, and alert text drawn on the thumbnail (1px black halo)
+//   - Name and DPS (1px black halo) and a centered icon on the thumbnail
 //
 // override_redirect = true lifts WM management (no titlebar, no taskbar
 // entry, no alt-tab inclusion) so we own the entire surface. We re-assert
@@ -35,12 +35,13 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use crate::config::{Config, DisplayMode, LiveSettings, LogsConfig};
+use crate::alert_icon::{alert_icon_px, shown_icon};
+use crate::config::{AlertClear, Config, DisplayMode, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
-use crate::eve_logs::LogLiveState;
+use crate::eve_logs::{AlertKind, LogLiveState};
 use crate::preview_common::{
-    dps_in_label, dps_out_label, preview_should_hide, title_label, DragRect, DragState,
-    ALERT_BANNER_PX,
+    dps_in_label, dps_out_label, preview_should_hide, thumbnail_dest, title_label, DragRect,
+    DragState,
 };
 use crate::preview_positions::PreviewPositions;
 use crate::window_manager::WindowManager;
@@ -95,7 +96,6 @@ const PREVIEW_HEIGHT: u16 = 270;
 
 const TITLE_STRIP_HEIGHT: u16 = 24;
 const BORDER_WIDTH: u16 = 3;
-const ALERT_BANNER_HEIGHT: u16 = ALERT_BANNER_PX as u16;
 const DPS_FONT_PX: f32 = 13.0;
 const TITLE_FONT_PX: f32 = 14.0;
 const TITLE_TEXT_LEFT_PAD: i16 = 10;
@@ -151,6 +151,12 @@ fn list_window_height(num_clients: usize) -> u16 {
         + LIST_ROW_TOP_PAD as u16
         + rows * LIST_ROW_HEIGHT
         + LIST_BOTTOM_PAD
+}
+
+fn preview_icon_px(width: u16, height: u16) -> i32 {
+    let (left, top, right, bottom) =
+        thumbnail_dest(width as i32, height as i32, BORDER_WIDTH as i32);
+    alert_icon_px((right - left).min(bottom - top), 1.0)
 }
 
 /// Spawn the Linux preview manager. Returns immediately; the manager
@@ -728,13 +734,15 @@ impl PreviewManager {
         }
     }
 
-    /// Clear the focused client's alert when inactive-only alerts are on.
-    /// No-op when the setting is off. Uses the character name resolved
-    /// by `update_active` so list and grid mode agree with previews.
+    /// Clear the focused client's alert. Inactive-only does this so the
+    /// icon is not shown on the client you are playing. Keep-until-switch
+    /// does it even when that checkbox is off, or the icon would never
+    /// leave the window you are already on.
     fn drop_focused_alert(&mut self) {
         let should_drop = {
             let logs = self.logs_config.lock_recover();
-            logs.enabled && logs.alerts_on_inactive_only
+            logs.enabled
+                && (logs.alerts_on_inactive_only || logs.alert_clear == AlertClear::UntilFocus)
         };
         if !should_drop {
             return;
@@ -744,21 +752,21 @@ impl PreviewManager {
         }
     }
 
-    /// Push solar-system titles and alert banners from the log tailer
-    /// onto preview chrome / list rows. Also drops the focused client's
-    /// alert when `alerts_on_inactive_only` is on.
+    /// Push solar-system titles and alert icons from the log tailer
+    /// onto preview chrome / list rows. Drops the focused client's
+    /// alert when the clear mode says to.
     fn apply_log_chrome(&mut self) -> Result<()> {
-        let (enabled, show_system, show_dps, inactive_only) = {
+        let (enabled, show_system, show_dps, clear) = {
             let logs = self.logs_config.lock_recover();
             (
                 logs.enabled,
                 logs.show_system,
                 logs.show_dps,
-                logs.alerts_on_inactive_only,
+                logs.alert_clear,
             )
         };
         let now = Instant::now();
-        if enabled && inactive_only {
+        if enabled {
             self.drop_focused_alert();
         }
 
@@ -771,7 +779,7 @@ impl PreviewManager {
                 } else {
                     None
                 };
-                let alert = live.alert_for(&name, now).map(|a| a.text.clone());
+                let alert = live.alert_for(&name, now, clear).map(|a| a.kind);
                 let dps = if show_dps { live.dps_for(&name) } else { None };
                 let taking = live.taking_damage(&name, now);
                 (system, alert, dps, taking)
@@ -783,10 +791,19 @@ impl PreviewManager {
                 .previews
                 .get(&name)
                 .is_some_and(|p| p.title_label != label);
-            let alert_changed = self
+            let icon_px = self
                 .previews
                 .get(&name)
-                .is_some_and(|p| p.alert_text != alert);
+                .map(|p| preview_icon_px(p.width, p.height))
+                .unwrap_or(16);
+            // Compare the stored flash flag before the assignment below.
+            // Swords replace the alert icon for the flash; `alert_kind`
+            // stays the event so the gold frame returns with it.
+            let icon_changed = self.previews.get(&name).is_some_and(|p| {
+                let have = shown_icon(p.taking_damage, p.alert_kind);
+                let want = shown_icon(taking, alert);
+                have != want || (want.is_some() && p.icon_px != icon_px)
+            });
             let (want_dps, in_l, out_l) = match dps {
                 Some(r) if !r.is_idle() => {
                     (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
@@ -803,8 +820,8 @@ impl PreviewManager {
             if title_changed {
                 self.rebuild_title_pixmap(&name, &label)?;
             }
-            if alert_changed {
-                self.rebuild_alert_pixmap(&name, alert.as_deref())?;
+            if icon_changed {
+                self.rebuild_alert_icon(&name, alert, taking, icon_px)?;
             }
             if dps_changed {
                 self.rebuild_dps_pixmaps(&name, want_dps, &in_l, &out_l)?;
@@ -814,7 +831,7 @@ impl PreviewManager {
                     p.taking_damage = taking;
                 }
             }
-            if title_changed || alert_changed || dps_changed || flash_changed {
+            if title_changed || icon_changed || dps_changed || flash_changed {
                 if let Some(p) = self.previews.get_mut(&name) {
                     p.dirty = true;
                 }
@@ -822,15 +839,15 @@ impl PreviewManager {
         }
 
         if self.list_window.is_some() {
-            // Force a row rebuild when labels/alerts shifted even if
-            // the character set didn't. update_list_rows no-ops when
-            // last_names + last_row_sig match.
+            // Force a row rebuild when labels, alerts, or the damage
+            // flash shifted even if the character set didn't.
+            // update_list_rows no-ops when last_names + last_row_sig match.
             self.update_list_rows()?;
             self.paint_list()?;
         }
         if self.grid_window.is_some() {
             // Runs after the focused client's alert is dropped, so the
-            // grid paint in this same tick sees the cleared banner.
+            // grid paint in this same tick sees the cleared icon.
             self.refresh_grid_chrome()?;
         }
         Ok(())
@@ -862,22 +879,21 @@ impl PreviewManager {
         Ok(())
     }
 
-    fn rebuild_alert_pixmap(&mut self, key: &str, text: Option<&str>) -> Result<()> {
+    fn rebuild_alert_icon(
+        &mut self,
+        key: &str,
+        kind: Option<AlertKind>,
+        taking: bool,
+        icon_px: i32,
+    ) -> Result<()> {
         let window = match self.previews.get(key) {
             Some(p) => p.window,
             None => return Ok(()),
         };
-        let new = if let Some(text) = text {
-            let (pixmap, picture, w, h) = create_halo_text_pixmap(
-                &self.conn,
-                window,
-                text,
-                NICOTINE_RED,
-                jetbrains_mono(),
-                TITLE_FONT_PX,
-                self.argb32_format,
-            )?;
-            Some((pixmap, picture, w, h, text.to_string()))
+        let new = if let Some(icon) = shown_icon(taking, kind) {
+            let (pixmap, picture, w, h) =
+                create_icon_pixmap(&self.conn, window, icon, icon_px, self.argb32_format)?;
+            Some((pixmap, picture, w, h, icon_px))
         } else {
             None
         };
@@ -888,17 +904,22 @@ impl PreviewManager {
             if let Some(pix) = p.alert_pixmap.take() {
                 let _ = self.conn.free_pixmap(pix);
             }
-            if let Some((pixmap, picture, w, h, text)) = new {
+            if let Some((pixmap, picture, w, h, px)) = new {
                 p.alert_pixmap = Some(pixmap);
                 p.alert_picture = Some(picture);
-                p.alert_text_w = w;
-                p.alert_text_h = h;
-                p.alert_text = Some(text);
+                p.icon_w = w;
+                p.icon_h = h;
+                p.icon_px = px;
             } else {
-                p.alert_text_w = 0;
-                p.alert_text_h = 0;
-                p.alert_text = None;
+                p.icon_w = 0;
+                p.icon_h = 0;
+                p.icon_px = 0;
             }
+            // The event, even when the pixmap is swords or empty.
+            p.alert_kind = kind;
+        } else if let Some((pixmap, picture, _, _, _)) = new {
+            let _ = self.conn.render_free_picture(picture);
+            let _ = self.conn.free_pixmap(pixmap);
         }
         Ok(())
     }
@@ -1232,7 +1253,7 @@ impl PreviewManager {
         self.active_character = new_active_character;
         // Consume the alert before the grid repaint below. A cycle that
         // lands and leaves again inside one reconcile tick would otherwise
-        // show the banner on a client the user already looked at.
+        // show the icon on a client the user already looked at.
         self.drop_focused_alert();
 
         // Per-preview chrome flip in Previews mode. Collect keys first

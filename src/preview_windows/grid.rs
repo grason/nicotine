@@ -328,28 +328,30 @@ impl PreviewManager {
     }
 
     fn grid_paint_key(&self, windows: &[crate::window_manager::EveWindow]) -> String {
-        let (columns, cell_w, hide_active, enabled) = {
+        let (enabled, clear) = {
+            let logs = self.logs_config.lock().unwrap();
+            (logs.enabled, logs.alert_clear)
+        };
+        let (columns, cell_w, hide_active) = {
             let live = self.live.lock().unwrap();
-            let enabled = self.logs_config.lock().unwrap().enabled;
             (
                 live.grid_columns,
                 live.grid_cell_width,
                 live.hide_active_preview,
-                enabled,
             )
         };
         let now = std::time::Instant::now();
-        let live = self.log_live.lock().unwrap();
+        let log = self.log_live.lock().unwrap();
         let mut key = format!("{columns}:{cell_w}:{hide_active}:{}", self.active_id);
         for window in windows {
             let alert = if enabled {
-                live.alert_for(&window.title, now)
-                    .map(|a| a.text.clone())
-                    .unwrap_or_default()
+                log.alert_for(&window.title, now, clear)
+                    .map(|a| a.kind.as_str())
+                    .unwrap_or("")
             } else {
-                String::new()
+                ""
             };
-            let taking = enabled && live.taking_damage(&window.title, now);
+            let taking = enabled && log.taking_damage(&window.title, now);
             key.push_str(&format!(
                 "|{}:{alert}:{taking}:{}",
                 window.title,
@@ -389,10 +391,13 @@ impl PreviewManager {
             return;
         }
 
-        let (columns, cell_w, enabled) = {
+        let (enabled, clear) = {
+            let logs = self.logs_config.lock().unwrap();
+            (logs.enabled, logs.alert_clear)
+        };
+        let (columns, cell_w) = {
             let live = self.live.lock().unwrap();
-            let enabled = self.logs_config.lock().unwrap().enabled;
-            (live.grid_columns, live.grid_cell_width, enabled)
+            (live.grid_columns, live.grid_cell_width)
         };
         let layout = grid_layout(windows.len(), columns, cell_w);
         let now = std::time::Instant::now();
@@ -403,13 +408,14 @@ impl PreviewManager {
                 let Some(cell) = layout.cells.get(index) else {
                     continue;
                 };
-                let is_active = window.id == self.active_id;
-                let alert = if enabled && !is_active {
-                    log.alert_for(&window.title, now).map(|a| a.text.clone())
+                let (kind, taking) = if enabled {
+                    (
+                        log.alert_for(&window.title, now, clear).map(|a| a.kind),
+                        log.taking_damage(&window.title, now),
+                    )
                 } else {
-                    None
+                    (None, false)
                 };
-                let is_alert = alert.is_some();
                 labels.push(super::overlay::GridLabel {
                     cell: GridRect {
                         x: cell.x,
@@ -417,8 +423,9 @@ impl PreviewManager {
                         w: cell.w,
                         h: cell.h,
                     },
-                    text: alert.unwrap_or_else(|| window.title.clone()),
-                    alert: is_alert,
+                    text: window.title.clone(),
+                    kind,
+                    taking,
                 });
             }
             labels
@@ -563,14 +570,16 @@ unsafe fn paint_grid(hwnd: HWND) {
     }
     let mgr = &*ptr;
     let windows = mgr.state.lock().unwrap().get_ordered_windows();
-    let (columns, cell_w, hide_active, enabled) = {
+    let (enabled, clear) = {
+        let logs = mgr.logs_config.lock().unwrap();
+        (logs.enabled, logs.alert_clear)
+    };
+    let (columns, cell_w, hide_active) = {
         let live = mgr.live.lock().unwrap();
-        let enabled = mgr.logs_config.lock().unwrap().enabled;
         (
             live.grid_columns,
             live.grid_cell_width,
             live.hide_active_preview,
-            enabled,
         )
     };
     let layout = grid_layout(windows.len(), columns, cell_w);
@@ -612,7 +621,12 @@ unsafe fn paint_grid(hwnd: HWND) {
             continue;
         };
         let is_active = window.id == mgr.active_id;
-        let alert = enabled && !is_active && log.alert_for(&window.title, now).is_some();
+        let kind = if enabled {
+            log.alert_for(&window.title, now, clear).map(|a| a.kind)
+        } else {
+            None
+        };
+        let alert = kind.is_some() && !is_active;
         let taking = enabled && log.taking_damage(&window.title, now);
         let hide = preview_should_hide(hide_active, is_active);
 
