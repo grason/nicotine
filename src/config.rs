@@ -201,7 +201,9 @@ pub struct LogsConfig {
     /// Override for the Gamelogs directory. Empty = auto-detect.
     #[serde(default)]
     pub gamelog_dir: String,
-    /// Show `Character - Jita` on preview title strips / list rows.
+    /// Show the solar system on preview titles and list rows
+    /// (`Name - Jita`), and on its own row above the name in the
+    /// compact grid.
     #[serde(default = "default_true")]
     pub show_system: bool,
     /// Thin incoming/outgoing DPS row under the preview title. Off the

@@ -105,7 +105,7 @@ pub const HALO_PAD: i32 = 1;
 
 /// Where a preview's name, DPS figures, and alert sit inside `outer`.
 /// `top` is the name band. DPS slots share that band's vertical span.
-/// `bottom` is the alert band (and, on the grid, the name band).
+/// `bottom` is the alert band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayBands {
     pub top: GridRect,
@@ -160,6 +160,47 @@ pub fn overlay_label_bands(
             h: bottom_h,
         },
     }
+}
+
+/// Bottom text rows of one compact-grid cell. `name` is the lower row.
+/// `system` is the row directly above it when a solar system is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridNameRows {
+    pub system: Option<GridRect>,
+    pub name: GridRect,
+}
+
+/// Place the character name along the bottom of a compact-grid cell.
+/// `row_h` is one text row (`GRID_SCRIM_PX`, already scaled). When
+/// `has_system` is set, a second row of the same height sits directly
+/// above the name. The name keeps its row; a cell with no room above
+/// it drops the system row.
+pub fn grid_name_rows(outer: GridRect, frame: i32, row_h: i32, has_system: bool) -> GridNameRows {
+    let frame = frame.max(0);
+    let row_h = row_h.max(0);
+    let inner_w = (outer.w - frame * 2).max(0);
+    let inner_h = (outer.h - frame * 2).max(0);
+    let name_h = row_h.min(inner_h);
+    let name = GridRect {
+        x: outer.x + frame,
+        y: outer.y + outer.h - frame - name_h,
+        w: inner_w,
+        h: name_h,
+    };
+    // A short leftover would slice the system glyphs. Drop the row
+    // unless a full second band fits above the name.
+    let room = inner_h.saturating_sub(name_h);
+    let system = if has_system && row_h > 0 && room >= row_h {
+        Some(GridRect {
+            x: name.x,
+            y: name.y - row_h,
+            w: inner_w,
+            h: row_h,
+        })
+    } else {
+        None
+    };
+    GridNameRows { system, name }
 }
 
 /// Premultiplied BGRA (little-endian) for a coverage mask, with a black
@@ -313,8 +354,10 @@ pub const GRID_CELL_WIDTH_DEFAULT: u32 = 160;
 pub const GRID_GAP_PX: i32 = 1;
 pub const GRID_OUTER_BORDER_PX: i32 = 2;
 
-/// Height of the name (or alert label) drawn across the bottom of a
-/// cell. The thumbnail fills the cell; this only places the text.
+/// Height of one text row on a compact-grid cell. The character name
+/// uses the bottom row. A known solar system uses a second row of the
+/// same height directly above it. The thumbnail fills the cell; this
+/// only places the text.
 pub const GRID_SCRIM_PX: i32 = 16;
 /// State border drawn inside a cell. The thumbnail stays inside it so
 /// the red/gold frame is not covered by the mirror.
@@ -972,6 +1015,109 @@ mod tests {
         assert_eq!(grid_cell_at(&layout.cells, 163, 2), Some(1));
         assert_eq!(grid_cell_at(&layout.cells, 0, 0), None);
         assert_eq!(grid_cell_at(&layout.cells, 2, 93), Some(2));
+    }
+
+    #[test]
+    fn grid_name_rows_without_system_is_the_bottom_band() {
+        let rows = grid_name_rows(
+            GridRect {
+                x: 2,
+                y: 2,
+                w: 160,
+                h: 90,
+            },
+            2,
+            16,
+            false,
+        );
+        assert_eq!(rows.system, None);
+        assert_eq!(
+            rows.name,
+            GridRect {
+                x: 4,
+                y: 74,
+                w: 156,
+                h: 16
+            }
+        );
+    }
+
+    #[test]
+    fn grid_name_rows_puts_the_system_above_the_name() {
+        let rows = grid_name_rows(
+            GridRect {
+                x: 2,
+                y: 2,
+                w: 160,
+                h: 90,
+            },
+            2,
+            16,
+            true,
+        );
+        assert_eq!(
+            rows.name,
+            GridRect {
+                x: 4,
+                y: 74,
+                w: 156,
+                h: 16
+            }
+        );
+        assert_eq!(
+            rows.system,
+            Some(GridRect {
+                x: 4,
+                y: 58,
+                w: 156,
+                h: 16
+            })
+        );
+    }
+
+    #[test]
+    fn grid_name_rows_drops_a_system_row_that_would_be_short() {
+        // 10px left above a 16px name: not enough for a full system row.
+        let rows = grid_name_rows(
+            GridRect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 30,
+            },
+            2,
+            16,
+            true,
+        );
+        assert_eq!(rows.system, None);
+        assert_eq!(rows.name.h, 16);
+        assert_eq!(rows.name.y, 12);
+    }
+
+    #[test]
+    fn grid_name_rows_drops_the_system_when_only_the_name_fits() {
+        // Frame 2px plus one 16px row: nothing left above the name.
+        let rows = grid_name_rows(
+            GridRect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 20,
+            },
+            2,
+            16,
+            true,
+        );
+        assert_eq!(rows.system, None);
+        assert_eq!(
+            rows.name,
+            GridRect {
+                x: 2,
+                y: 2,
+                w: 36,
+                h: 16
+            }
+        );
     }
 
     #[test]

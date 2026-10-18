@@ -328,9 +328,9 @@ impl PreviewManager {
     }
 
     fn grid_paint_key(&self, windows: &[crate::window_manager::EveWindow]) -> String {
-        let (enabled, clear) = {
+        let (enabled, show_system, clear) = {
             let logs = self.logs_config.lock().unwrap();
-            (logs.enabled, logs.alert_clear)
+            (logs.enabled, logs.show_system, logs.alert_clear)
         };
         let (columns, cell_w, hide_active) = {
             let live = self.live.lock().unwrap();
@@ -352,8 +352,13 @@ impl PreviewManager {
                 ""
             };
             let taking = enabled && log.taking_damage(&window.title, now);
+            let system = if enabled && show_system {
+                log.system_for(&window.title).unwrap_or("")
+            } else {
+                ""
+            };
             key.push_str(&format!(
-                "|{}:{alert}:{taking}:{}",
+                "|{}:{system}:{alert}:{taking}:{}",
                 window.title,
                 window.id == self.active_id
             ));
@@ -361,7 +366,7 @@ impl PreviewManager {
         key
     }
 
-    /// Redraw the label popup when names, alerts, size, or opacity change,
+    /// Redraw the label popup when names, systems, alerts, size, or opacity change,
     /// and re-pin it to the grid window every tick. Owned popups do not
     /// follow the owner.
     pub(super) fn refresh_grid_overlay(&mut self) {
@@ -391,9 +396,9 @@ impl PreviewManager {
             return;
         }
 
-        let (enabled, clear) = {
+        let (enabled, show_system, clear) = {
             let logs = self.logs_config.lock().unwrap();
-            (logs.enabled, logs.alert_clear)
+            (logs.enabled, logs.show_system, logs.alert_clear)
         };
         let (columns, cell_w) = {
             let live = self.live.lock().unwrap();
@@ -408,13 +413,22 @@ impl PreviewManager {
                 let Some(cell) = layout.cells.get(index) else {
                     continue;
                 };
-                let (kind, taking) = if enabled {
+                let (kind, taking, system) = if enabled {
+                    let system = if show_system {
+                        log.system_for(&window.title)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
                     (
                         log.alert_for(&window.title, now, clear).map(|a| a.kind),
                         log.taking_damage(&window.title, now),
+                        system,
                     )
                 } else {
-                    (None, false)
+                    (None, false, String::new())
                 };
                 labels.push(super::overlay::GridLabel {
                     cell: GridRect {
@@ -424,6 +438,7 @@ impl PreviewManager {
                         h: cell.h,
                     },
                     text: window.title.clone(),
+                    system,
                     kind,
                     taking,
                 });

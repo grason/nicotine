@@ -18,8 +18,8 @@ use std::sync::OnceLock;
 use crate::alert_icon::{alert_icon_px, raster_icon, shown_icon, ShownIcon};
 use crate::eve_logs::AlertKind;
 use crate::preview_common::{
-    cover_with_halo, grid_thumb_bounds, overlay_label_bands, thumbnail_dest, GridCell, GridRect,
-    DPS_SLOT_PX, HALO_PAD,
+    cover_with_halo, grid_name_rows, grid_thumb_bounds, overlay_label_bands, thumbnail_dest,
+    GridCell, GridRect, DPS_SLOT_PX, HALO_PAD,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -413,17 +413,20 @@ pub(super) fn preview_pixels(
 }
 
 /// One grid cell's name plus the alert icon, if any. The name stays cream.
+/// `system` is the row above the name, or empty when that row is hidden.
 /// `taking` draws crossed swords in the icon slot for the damage flash.
 pub(super) struct GridLabel {
     pub cell: GridRect,
     pub text: String,
+    pub system: String,
     pub kind: Option<AlertKind>,
     pub taking: bool,
 }
 
-/// Cream names along the bottom of each cell, and an icon centered
-/// on the thumbnail. The outer border and each cell frame are punched
-/// clear so a text halo stays off the GDI state border underneath.
+/// Cream name along the bottom of each cell, the solar system on the
+/// row above it, and an icon centered on the thumbnail. The outer
+/// border and each cell frame are punched clear so a text halo stays
+/// off the GDI state border underneath.
 pub(super) fn grid_pixels(
     width: i32,
     height: i32,
@@ -439,12 +442,22 @@ pub(super) fn grid_pixels(
     let mut rasters = Vec::new();
     let mut clear = frame_rects(width, height, outer_border);
     for label in labels {
-        let band = overlay_label_bands(label.cell, inset, scrim, scrim, 0).bottom;
+        let rows = grid_name_rows(label.cell, inset, scrim, !label.system.is_empty());
+        if let Some(band) = rows.system {
+            push_glyph(
+                &mut glyphs,
+                &label.system,
+                cream,
+                rect_of(band),
+                font,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
         push_glyph(
             &mut glyphs,
             &label.text,
             cream,
-            rect_of(band),
+            rect_of(rows.name),
             font,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );

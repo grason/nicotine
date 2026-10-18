@@ -183,7 +183,7 @@ Previews and the list window:
 
 The Alerts tab tails EVE's Chatlogs and Gamelogs (read-only). Enable it there.
 
-- Preview title strips show `Character - Jita` once a system is known
+- Preview title strips show `Character - Jita` once a system is known. The compact grid shows that system on the row above the character name
 - Incoming (↓) / outgoing (↑) DPS from the combat log sit on the left and right of the preview title. They hide when idle
 - Taking damage shows crossed swords and flashes that client's frame red for a moment (coalesced so a volley is one pulse). The swords use the icon slot for the whole flash, including on the client you are flying
 - An event icon sits in the middle of that client's thumbnail, and at the right of its list row. The frame turns gold on an inactive client while that icon is up. The character name stays

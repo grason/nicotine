@@ -467,7 +467,7 @@ fn alerts_section(panel: &Panel) -> Element<'_, Message> {
             .label("Enable log monitoring")
             .on_toggle(Message::LogsEnabledToggled),
         checkbox(logs.show_system)
-            .label("Show solar system on preview titles and the client list")
+            .label("Show solar system on preview titles, the client list, and the compact grid")
             .on_toggle(Message::ShowSystemToggled),
         checkbox(logs.show_dps)
             .label("Show incoming / outgoing DPS on preview titles")

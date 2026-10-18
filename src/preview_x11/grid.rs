@@ -24,8 +24,8 @@ use x11rb::COPY_DEPTH_FROM_PARENT;
 use crate::alert_icon::{alert_icon_px, shown_icon};
 use crate::eve_logs::AlertKind;
 use crate::preview_common::{
-    fit_contain, grid_layout, grid_thumb_bounds, overlay_label_bands, preview_should_hide,
-    GridCell, GridRect, GRID_GAP_PX, GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX, HALO_PAD,
+    fit_contain, grid_layout, grid_name_rows, grid_thumb_bounds, preview_should_hide, GridCell,
+    GridRect, GRID_GAP_PX, GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX, HALO_PAD,
 };
 
 use super::render::{
@@ -47,6 +47,9 @@ struct PaintSnap {
     text_picture: u32,
     text_w: u16,
     text_h: u16,
+    system_picture: Option<u32>,
+    system_w: u16,
+    system_h: u16,
     is_active: bool,
     taking_damage: bool,
     alert_kind: Option<AlertKind>,
@@ -70,6 +73,12 @@ struct GridSource {
     /// sets this so only the client that drew pays for a round-trip.
     fresh: bool,
     label: String,
+    /// Solar system drawn above the name. Empty when the row is hidden.
+    system: String,
+    system_pixmap: Option<u32>,
+    system_picture: Option<u32>,
+    system_w: u16,
+    system_h: u16,
     alert_kind: Option<AlertKind>,
     icon_pixmap: Option<u32>,
     icon_picture: Option<u32>,
@@ -91,6 +100,12 @@ impl Drop for GridSource {
         let _ = self.conn.render_free_picture(self.src_picture);
         let _ = self.conn.render_free_picture(self.text_picture);
         let _ = self.conn.free_pixmap(self.text_pixmap);
+        if let Some(pic) = self.system_picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = self.system_pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
         if let Some(pic) = self.icon_picture {
             let _ = self.conn.render_free_picture(pic);
         }
@@ -104,11 +119,24 @@ impl Drop for GridSource {
     }
 }
 
+/// One cell's inputs to the last paint. Compared so a system change
+/// repaints without resizing the window.
+#[derive(PartialEq, Eq)]
+struct GridChromeEntry {
+    character_name: String,
+    label: String,
+    system: String,
+    is_active: bool,
+    alert_kind: Option<AlertKind>,
+    taking_damage: bool,
+    hide_thumb: bool,
+}
+
 /// What the last paint drew. Refresh skips the composite when this
 /// still matches, so a quiet grid does not repaint at 10 Hz.
 #[derive(PartialEq, Eq)]
 struct GridChrome {
-    entries: Vec<(String, String, bool, Option<AlertKind>, bool, bool)>,
+    entries: Vec<GridChromeEntry>,
     columns: u32,
     cell_w: u32,
     width: u16,
@@ -142,6 +170,52 @@ impl Drop for OwnedGrid {
         let _ = self.conn.destroy_window(self.window);
         let _ = self.conn.flush();
     }
+}
+
+/// Center a haloed label in `band`. A pixmap wider than the band is
+/// left-clipped to the band, with the 1px halo allowed to spill.
+fn composite_label(
+    conn: &RustConnection,
+    picture: u32,
+    dst: u32,
+    band: GridRect,
+    text_w: u16,
+    text_h: u16,
+) -> Result<()> {
+    if text_w == 0 || text_h == 0 || band.w <= 0 || band.h <= 0 {
+        return Ok(());
+    }
+    let wider = text_w as i32 > band.w;
+    let tx = if wider {
+        band.x - HALO_PAD
+    } else {
+        band.x + (band.w - text_w as i32) / 2
+    };
+    let ty = band.y + (band.h - text_h as i32) / 2;
+    let draw_w = if wider {
+        (band.w + HALO_PAD * 2).max(0) as u16
+    } else {
+        text_w
+    };
+    let draw_w = draw_w.min(text_w);
+    if draw_w == 0 {
+        return Ok(());
+    }
+    conn.render_composite(
+        PictOp::OVER,
+        picture,
+        x11rb::NONE,
+        dst,
+        0,
+        0,
+        0,
+        0,
+        tx as i16,
+        ty as i16,
+        draw_w,
+        text_h,
+    )?;
+    Ok(())
 }
 
 impl PreviewManager {
@@ -402,6 +476,11 @@ impl PreviewManager {
             source_h: geom.height,
             fresh: false,
             label: title.to_string(),
+            system: String::new(),
+            system_pixmap: None,
+            system_picture: None,
+            system_w: 0,
+            system_h: 0,
             alert_kind: None,
             icon_pixmap: None,
             icon_picture: None,
@@ -476,9 +555,9 @@ impl PreviewManager {
             .map(|g| g.sources.iter().map(|s| s.character_name.clone()).collect())
             .unwrap_or_default();
         let now = Instant::now();
-        let (enabled, clear) = {
+        let (enabled, show_system, clear) = {
             let logs = self.logs_config.lock_recover();
-            (logs.enabled, logs.alert_clear)
+            (logs.enabled, logs.show_system, logs.alert_clear)
         };
         for name in &names {
             let (is_active, kind, taking) = {
@@ -511,6 +590,17 @@ impl PreviewManager {
             if needs_text {
                 self.rebuild_grid_label(name, name)?;
             }
+            let system = if enabled && show_system {
+                self.log_live
+                    .lock_recover()
+                    .system_for(name)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            self.sync_grid_system(name, &system)?;
             // sync reads the stored flash flag, so assign taking_damage after.
             self.sync_grid_icon(name, kind, taking, icon_px)?;
             if let Some(grid) = self.grid_window.as_mut() {
@@ -542,15 +632,14 @@ impl PreviewManager {
             entries: grid
                 .sources
                 .iter()
-                .map(|s| {
-                    (
-                        s.character_name.clone(),
-                        s.label.clone(),
-                        s.is_active,
-                        s.alert_kind,
-                        s.taking_damage,
-                        s.hide_thumb,
-                    )
+                .map(|s| GridChromeEntry {
+                    character_name: s.character_name.clone(),
+                    label: s.label.clone(),
+                    system: s.system.clone(),
+                    is_active: s.is_active,
+                    alert_kind: s.alert_kind,
+                    taking_damage: s.taking_damage,
+                    hide_thumb: s.hide_thumb,
                 })
                 .collect(),
             columns,
@@ -599,6 +688,91 @@ impl PreviewManager {
             src.label = label.to_string();
         }
         Ok(())
+    }
+
+    /// Rebuild or drop the system-row pixmap. A quiet grid skips this
+    /// when the string already matches.
+    fn sync_grid_system(&mut self, name: &str, system: &str) -> Result<()> {
+        let current = self.grid_window.as_ref().and_then(|g| {
+            g.sources
+                .iter()
+                .find(|s| s.character_name == name)
+                .map(|s| s.system.clone())
+        });
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current == system {
+            return Ok(());
+        }
+        if system.is_empty() {
+            self.clear_grid_system(name);
+            return Ok(());
+        }
+        let window = match self.grid_window.as_ref().map(|g| g.window) {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let (pixmap, picture, w, h) = create_halo_text_pixmap(
+            &self.conn,
+            window,
+            system,
+            NICOTINE_CREAM,
+            jetbrains_mono(),
+            GRID_NAME_FONT_PX,
+            self.argb32_format,
+        )?;
+        let old = self.grid_window.as_ref().and_then(|g| {
+            g.sources
+                .iter()
+                .find(|s| s.character_name == name)
+                .map(|s| (s.system_picture, s.system_pixmap))
+        });
+        let Some((old_picture, old_pixmap)) = old else {
+            let _ = self.conn.render_free_picture(picture);
+            let _ = self.conn.free_pixmap(pixmap);
+            return Ok(());
+        };
+        if let Some(pic) = old_picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = old_pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
+        if let Some(src) = self
+            .grid_window
+            .as_mut()
+            .and_then(|g| g.sources.iter_mut().find(|s| s.character_name == name))
+        {
+            src.system_pixmap = Some(pixmap);
+            src.system_picture = Some(picture);
+            src.system_w = w;
+            src.system_h = h;
+            src.system = system.to_string();
+        } else {
+            let _ = self.conn.render_free_picture(picture);
+            let _ = self.conn.free_pixmap(pixmap);
+        }
+        Ok(())
+    }
+
+    fn clear_grid_system(&mut self, name: &str) {
+        let old = self.grid_window.as_mut().and_then(|g| {
+            let src = g.sources.iter_mut().find(|s| s.character_name == name)?;
+            src.system.clear();
+            src.system_w = 0;
+            src.system_h = 0;
+            Some((src.system_picture.take(), src.system_pixmap.take()))
+        });
+        let Some((picture, pixmap)) = old else {
+            return;
+        };
+        if let Some(pic) = picture {
+            let _ = self.conn.render_free_picture(pic);
+        }
+        if let Some(pix) = pixmap {
+            let _ = self.conn.free_pixmap(pix);
+        }
     }
 
     fn sync_grid_icon(
@@ -724,6 +898,9 @@ impl PreviewManager {
                     text_picture: src.text_picture,
                     text_w: src.text_w,
                     text_h: src.text_h,
+                    system_picture: src.system_picture,
+                    system_w: src.system_w,
+                    system_h: src.system_h,
                     is_active: src.is_active,
                     taking_damage: src.taking_damage,
                     alert_kind: src.alert_kind,
@@ -799,10 +976,11 @@ impl PreviewManager {
                 )?;
             }
 
-            // Name sits on the picture. The alert icon is centered on the
+            // Name sits on the picture, with the system on the row above
+            // it when one is known. The alert icon is centered on the
             // cell, including a hide-active slot that stays dark. The
             // frame below covers any halo spill.
-            let band = overlay_label_bands(
+            let rows = grid_name_rows(
                 GridRect {
                     x: cell.x,
                     y: cell.y,
@@ -811,39 +989,21 @@ impl PreviewManager {
                 },
                 layout.cell_inset,
                 layout.scrim,
-                layout.scrim,
-                0,
-            )
-            .bottom;
-            let wider = src.text_w as i32 > band.w;
-            let tx = if wider {
-                band.x - HALO_PAD
-            } else {
-                band.x + (band.w - src.text_w as i32) / 2
-            };
-            let ty = band.y + (band.h - src.text_h as i32) / 2;
-            let draw_w = if wider {
-                (band.w + HALO_PAD * 2).max(0) as u16
-            } else {
-                src.text_w
-            };
-            let draw_w = draw_w.min(src.text_w);
-            if draw_w > 0 && src.text_h > 0 && band.h > 0 {
-                self.conn.render_composite(
-                    PictOp::OVER,
-                    src.text_picture,
-                    x11rb::NONE,
-                    dst,
-                    0,
-                    0,
-                    0,
-                    0,
-                    tx as i16,
-                    ty as i16,
-                    draw_w,
-                    src.text_h,
-                )?;
+                src.system_picture.is_some(),
+            );
+            if let Some(picture) = src.system_picture {
+                if let Some(band) = rows.system {
+                    composite_label(&self.conn, picture, dst, band, src.system_w, src.system_h)?;
+                }
             }
+            composite_label(
+                &self.conn,
+                src.text_picture,
+                dst,
+                rows.name,
+                src.text_w,
+                src.text_h,
+            )?;
 
             if let Some(picture) = src.icon_picture {
                 let bounds = grid_thumb_bounds(cell, layout.cell_inset);
