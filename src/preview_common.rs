@@ -404,9 +404,12 @@ pub struct GridLayout {
 /// Lay out `count` cells. `columns` clamps to 1–5 and `cell_w` to
 /// 96–240 before scaling, so a hand-edited config cannot produce a
 /// zero-size window. `scale` is 1.0 on Linux and the system DPI scale
-/// on Windows (1.0 at 96 DPI). Width stays `columns` cells wide even
-/// when the last row is short, so the window does not jump narrower
-/// as clients log out. `count == 0` is an empty layout (no window).
+/// on Windows (1.0 at 96 DPI).
+///
+/// Width is `min(columns, count)` cells, so a single row grows and
+/// shrinks as clients log in and out. Once a second row exists the
+/// window stays `columns` wide: a short last row must not narrow the
+/// full rows above it. `count == 0` is an empty layout (no window).
 pub fn grid_layout(
     count: usize,
     columns: u32,
@@ -457,8 +460,11 @@ pub fn grid_layout_scaled(
     }
 
     let cols = columns as usize;
+    // One short row is only as wide as the clients in it. A second row
+    // means some earlier row is full, so the window stays `columns` wide.
+    let used_cols = cols.min(count);
     let rows = count.div_ceil(cols);
-    let window_w = border_px * 2 + cols as i32 * cell_w_px + (cols as i32 - 1) * gap_px;
+    let window_w = border_px * 2 + used_cols as i32 * cell_w_px + (used_cols as i32 - 1) * gap_px;
     let window_h = border_px * 2 + rows as i32 * cell_h_px + (rows as i32 - 1) * gap_px;
 
     let mut cells = Vec::with_capacity(count);
@@ -973,11 +979,32 @@ mod tests {
     }
 
     #[test]
-    fn grid_one_client_keeps_the_column_width() {
+    fn grid_one_client_shrinks_to_one_column() {
         let layout = grid_layout(1, 2, 160, 1, 2);
-        assert_eq!(layout.window_w, 325);
+        assert_eq!(layout.window_w, 2 * 2 + 160);
         assert_eq!(layout.window_h, 2 * 2 + 90);
         assert_eq!(layout.cells.len(), 1);
+    }
+
+    #[test]
+    fn grid_short_row_tracks_client_count_until_a_second_row() {
+        // 5 configured columns, fewer clients than that: the window is
+        // exactly as wide as the occupied cells, and grows as they log in.
+        let one = grid_layout(1, 5, 160, 1, 2);
+        let four = grid_layout(4, 5, 160, 1, 2);
+        let five = grid_layout(5, 5, 160, 1, 2);
+        assert_eq!(one.window_h, four.window_h);
+        assert_eq!(four.window_h, five.window_h);
+        assert!(one.window_w < four.window_w);
+        assert!(four.window_w < five.window_w);
+        assert_eq!(four.window_w, 2 * 2 + 4 * 160 + 3 * 1);
+        // A second row does not narrow the full row above it, and
+        // dropping back to one full row shortens the window.
+        let six = grid_layout(6, 5, 160, 1, 2);
+        assert_eq!(six.window_w, five.window_w);
+        assert!(six.window_h > five.window_h);
+        assert_eq!(six.cells.len(), 6);
+        assert_eq!(six.cells[5].x, 2);
     }
 
     #[test]
