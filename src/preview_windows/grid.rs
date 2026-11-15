@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 
 use crate::preview_common::{
-    fit_contain, grid_cell_at, grid_layout_scaled, grid_thumb_bounds, preview_should_hide,
-    GridLayout, GridRect, GRID_GAP_PX, GRID_OUTER_BORDER_PX,
+    fit_cover, grid_cell_at, grid_layout_scaled, preview_should_hide, GridLayout, GridRect,
+    GRID_GAP_PX, GRID_OUTER_BORDER_PX,
 };
 use crate::preview_positions::PreviewPositions;
 use crate::windows_manager::id_to_hwnd;
@@ -15,7 +15,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
-    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
+    DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
@@ -276,7 +277,12 @@ impl PreviewManager {
             let Some(cell) = layout.cells.get(index) else {
                 continue;
             };
-            let bounds = grid_thumb_bounds(*cell, layout.cell_inset);
+            let dest = GridRect {
+                x: cell.x,
+                y: cell.y,
+                w: cell.w,
+                h: cell.h,
+            };
             let (src_w, src_h) = unsafe {
                 let mut src_rect = RECT::default();
                 if GetWindowRect(id_to_hwnd(thumb.source_id), &mut src_rect).is_ok() {
@@ -288,19 +294,30 @@ impl PreviewManager {
                     (0, 0)
                 }
             };
-            // Zero size fills the content box. A live client is letterboxed.
-            let fitted = fit_contain(src_w, src_h, bounds);
+            // Cover-crop into the cell. A zero source still fills the cell
+            // and leaves rcSource as the whole window.
+            let cover = fit_cover(src_w, src_h, dest);
+            let use_source = src_w > 0 && src_h > 0;
             let is_active = thumb.source_id == self.active_id;
             let visible = !preview_should_hide(hide_active, is_active);
+            let mut flags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY;
+            if use_source {
+                flags |= DWM_TNP_RECTSOURCE;
+            }
             let props = DWM_THUMBNAIL_PROPERTIES {
-                dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
+                dwFlags: flags,
                 rcDestination: RECT {
-                    left: fitted.x,
-                    top: fitted.y,
-                    right: fitted.x + fitted.w,
-                    bottom: fitted.y + fitted.h,
+                    left: dest.x,
+                    top: dest.y,
+                    right: dest.x + dest.w,
+                    bottom: dest.y + dest.h,
                 },
-                rcSource: RECT::default(),
+                rcSource: RECT {
+                    left: cover.src_x,
+                    top: cover.src_y,
+                    right: cover.src_x + cover.src_w,
+                    bottom: cover.src_y + cover.src_h,
+                },
                 opacity: 255,
                 fVisible: visible.into(),
                 fSourceClientAreaOnly: false.into(),
@@ -328,9 +345,14 @@ impl PreviewManager {
     }
 
     fn grid_paint_key(&self, windows: &[crate::window_manager::EveWindow]) -> String {
-        let (enabled, show_system, clear) = {
+        let (enabled, show_system, show_dps, clear) = {
             let logs = self.logs_config.lock().unwrap();
-            (logs.enabled, logs.show_system, logs.alert_clear)
+            (
+                logs.enabled,
+                logs.show_system,
+                logs.show_dps,
+                logs.alert_clear,
+            )
         };
         let (columns, cell_w, hide_active) = {
             let live = self.live.lock().unwrap();
@@ -342,23 +364,38 @@ impl PreviewManager {
         };
         let now = std::time::Instant::now();
         let log = self.log_live.lock().unwrap();
+        let test = self.test_chrome;
         let mut key = format!("{columns}:{cell_w}:{hide_active}:{}", self.active_id);
         for window in windows {
-            let alert = if enabled {
-                log.alert_for(&window.title, now, clear)
-                    .map(|a| a.kind.as_str())
-                    .unwrap_or("")
+            let (alert, taking, meter) = if let Some(sample) = test {
+                (
+                    sample.alert.map(|k| k.as_str()).unwrap_or(""),
+                    sample.taking_damage,
+                    sample.meter.sig(),
+                )
             } else {
-                ""
+                let alert = if enabled {
+                    log.alert_for(&window.title, now, clear)
+                        .map(|a| a.kind.as_str())
+                        .unwrap_or("")
+                } else {
+                    ""
+                };
+                let taking = enabled && log.taking_damage(&window.title, now);
+                let meter = if enabled && show_dps {
+                    log.meter_for(&window.title).unwrap_or_default().sig()
+                } else {
+                    String::new()
+                };
+                (alert, taking, meter)
             };
-            let taking = enabled && log.taking_damage(&window.title, now);
             let system = if enabled && show_system {
                 log.system_for(&window.title).unwrap_or("")
             } else {
                 ""
             };
             key.push_str(&format!(
-                "|{}:{system}:{alert}:{taking}:{}",
+                "|{}:{system}:{alert}:{taking}:{}:{meter}",
                 window.title,
                 window.id == self.active_id
             ));
@@ -396,9 +433,14 @@ impl PreviewManager {
             return;
         }
 
-        let (enabled, show_system, clear) = {
+        let (enabled, show_system, show_dps, clear) = {
             let logs = self.logs_config.lock().unwrap();
-            (logs.enabled, logs.show_system, logs.alert_clear)
+            (
+                logs.enabled,
+                logs.show_system,
+                logs.show_dps,
+                logs.alert_clear,
+            )
         };
         let (columns, cell_w) = {
             let live = self.live.lock().unwrap();
@@ -406,6 +448,7 @@ impl PreviewManager {
         };
         let layout = grid_layout(windows.len(), columns, cell_w);
         let now = std::time::Instant::now();
+        let test = self.test_chrome;
         let labels = {
             let log = self.log_live.lock().unwrap();
             let mut labels = Vec::with_capacity(windows.len());
@@ -413,7 +456,17 @@ impl PreviewManager {
                 let Some(cell) = layout.cells.get(index) else {
                     continue;
                 };
-                let (kind, taking, system) = if enabled {
+                let (kind, taking, system, meter) = if let Some(sample) = test {
+                    let system = if enabled && show_system {
+                        log.system_for(&window.title)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    (sample.alert, sample.taking_damage, system, sample.meter)
+                } else if enabled {
                     let system = if show_system {
                         log.system_for(&window.title)
                             .filter(|s| !s.is_empty())
@@ -422,13 +475,24 @@ impl PreviewManager {
                     } else {
                         String::new()
                     };
+                    let meter = if show_dps {
+                        log.meter_for(&window.title).unwrap_or_default()
+                    } else {
+                        crate::eve_logs::CombatMeter::default()
+                    };
                     (
                         log.alert_for(&window.title, now, clear).map(|a| a.kind),
                         log.taking_damage(&window.title, now),
                         system,
+                        meter,
                     )
                 } else {
-                    (None, false, String::new())
+                    (
+                        None,
+                        false,
+                        String::new(),
+                        crate::eve_logs::CombatMeter::default(),
+                    )
                 };
                 labels.push(super::overlay::GridLabel {
                     cell: GridRect {
@@ -441,6 +505,7 @@ impl PreviewManager {
                     system,
                     kind,
                     taking,
+                    meter,
                 });
             }
             labels

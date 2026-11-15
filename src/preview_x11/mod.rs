@@ -38,10 +38,10 @@ use x11rb::wrapper::ConnectionExt as _;
 use crate::alert_icon::{alert_icon_px, shown_icon};
 use crate::config::{AlertClear, Config, DisplayMode, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
-use crate::eve_logs::{AlertKind, LogLiveState};
+use crate::eve_logs::{AlertKind, CombatMeter, LogLiveState};
 use crate::preview_common::{
-    dps_in_label, dps_out_label, preview_should_hide, thumbnail_dest, title_label, DragRect,
-    DragState,
+    dps_in_label, dps_out_label, preview_should_hide, thumbnail_dest, title_label, ChromeSample,
+    ChromeTestClock, DragRect, DragState,
 };
 use crate::preview_positions::PreviewPositions;
 use crate::window_manager::WindowManager;
@@ -291,6 +291,8 @@ fn run_manager(
         grid_ids: HashMap::new(),
         needs_window_scan: true,
         last_window_scan: Instant::now(),
+        chrome_clock: ChromeTestClock::default(),
+        test_chrome: None,
     };
     manager.run()
 }
@@ -383,6 +385,10 @@ struct PreviewManager {
     /// `WINDOW_SCAN_BACKSTOP` periodic re-scan that catches EVE clients
     /// whose title only becomes "EVE - <name>" after the user logs in.
     last_window_scan: Instant,
+    /// Advances one test-chrome step every [`crate::preview_common::CHROME_TEST_HOLD`].
+    chrome_clock: ChromeTestClock,
+    /// Sample for this reconcile. `None` paints live log chrome.
+    test_chrome: Option<ChromeSample>,
 }
 
 impl PreviewManager {
@@ -430,7 +436,13 @@ impl PreviewManager {
         }
     }
 
+    fn sync_test_chrome(&mut self) {
+        let on = self.live.lock_recover().chrome_test;
+        self.test_chrome = self.chrome_clock.sample(on, Instant::now());
+    }
+
     fn reconcile(&mut self) -> Result<()> {
+        self.sync_test_chrome();
         // Panel show/hide toggle. Drop all surfaces when the user
         // unchecks "Show preview windows" so the manager goes truly
         // dark (no override_redirect windows lingering, no XComposite
@@ -772,7 +784,7 @@ impl PreviewManager {
 
         let keys: Vec<String> = self.previews.keys().cloned().collect();
         for name in keys {
-            let (system, alert, dps, taking) = if enabled {
+            let (system, alert, dps, taking, meter) = if enabled {
                 let live = self.log_live.lock_recover();
                 let system = if show_system {
                     live.system_for(&name).map(|s| s.to_string())
@@ -782,9 +794,19 @@ impl PreviewManager {
                 let alert = live.alert_for(&name, now, clear).map(|a| a.kind);
                 let dps = if show_dps { live.dps_for(&name) } else { None };
                 let taking = live.taking_damage(&name, now);
-                (system, alert, dps, taking)
+                let meter = if show_dps {
+                    live.meter_for(&name).unwrap_or_default()
+                } else {
+                    CombatMeter::default()
+                };
+                (system, alert, dps, taking, meter)
             } else {
-                (None, None, None, false)
+                (None, None, None, false, CombatMeter::default())
+            };
+            let (alert, taking, meter) = if let Some(sample) = self.test_chrome {
+                (sample.alert, sample.taking_damage, sample.meter)
+            } else {
+                (alert, taking, meter)
             };
             let label = title_label(&name, system.as_deref());
             let title_changed = self
@@ -804,11 +826,22 @@ impl PreviewManager {
                 let want = shown_icon(taking, alert);
                 have != want || (want.is_some() && p.icon_px != icon_px)
             });
-            let (want_dps, in_l, out_l) = match dps {
-                Some(r) if !r.is_idle() => {
-                    (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
+            let (want_dps, in_l, out_l) = if let Some(sample) = self.test_chrome {
+                match (sample.dps_in, sample.dps_out) {
+                    (None, None) => (false, String::new(), String::new()),
+                    (inn, out) => (
+                        true,
+                        inn.unwrap_or("").to_string(),
+                        out.unwrap_or("").to_string(),
+                    ),
                 }
-                _ => (false, String::new(), String::new()),
+            } else {
+                match dps {
+                    Some(r) if !r.is_idle() => {
+                        (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
+                    }
+                    _ => (false, String::new(), String::new()),
+                }
             };
             let dps_changed = self.previews.get(&name).is_some_and(|p| {
                 p.showing_dps != want_dps || p.dps_in_label != in_l || p.dps_out_label != out_l
@@ -817,6 +850,7 @@ impl PreviewManager {
                 .previews
                 .get(&name)
                 .is_some_and(|p| p.taking_damage != taking);
+            let meter_changed = self.previews.get(&name).is_some_and(|p| p.meter != meter);
             if title_changed {
                 self.rebuild_title_pixmap(&name, &label)?;
             }
@@ -826,12 +860,17 @@ impl PreviewManager {
             if dps_changed {
                 self.rebuild_dps_pixmaps(&name, want_dps, &in_l, &out_l)?;
             }
-            if flash_changed {
+            if flash_changed || meter_changed {
                 if let Some(p) = self.previews.get_mut(&name) {
-                    p.taking_damage = taking;
+                    if flash_changed {
+                        p.taking_damage = taking;
+                    }
+                    if meter_changed {
+                        p.meter = meter;
+                    }
                 }
             }
-            if title_changed || icon_changed || dps_changed || flash_changed {
+            if title_changed || icon_changed || dps_changed || flash_changed || meter_changed {
                 if let Some(p) = self.previews.get_mut(&name) {
                     p.dirty = true;
                 }

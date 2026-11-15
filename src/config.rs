@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A single per-character hotkey binding. `vk` is a Win32 Virtual-Key
 /// code (or evdev code on Linux); `modifier` is an optional second VK
@@ -62,6 +63,9 @@ pub struct LiveSettings {
     pub grid_columns: u32,
     /// Compact-grid cell width in reference pixels (96 DPI).
     pub grid_cell_width: u32,
+    /// Session-only. Steps preview and grid chrome through bars and
+    /// alert icons. Not written to config.toml.
+    pub chrome_test: bool,
 }
 
 impl LiveSettings {
@@ -76,6 +80,7 @@ impl LiveSettings {
             hide_active_preview: config.hide_active_preview,
             grid_columns: config.grid_columns,
             grid_cell_width: config.grid_cell_width,
+            chrome_test: false,
         }))
     }
 }
@@ -206,10 +211,15 @@ pub struct LogsConfig {
     /// compact grid.
     #[serde(default = "default_true")]
     pub show_system: bool,
-    /// Thin incoming/outgoing DPS row under the preview title. Off the
-    /// alert icon on purpose — combat ticks are too frequent to flash.
+    /// Thin incoming/outgoing DPS row under the preview title, plus the
+    /// side bars on each thumbnail. Off the alert icon on purpose —
+    /// combat ticks are too frequent to flash.
     #[serde(default = "default_true")]
     pub show_dps: bool,
+    /// Turret cycle time in milliseconds. The green bar scores about
+    /// four cycles. Clamped to 500–20000 when read. Default 4 seconds.
+    #[serde(default = "default_turret_cycle_ms")]
+    pub turret_cycle_ms: u32,
     /// Drop / clear alerts for the currently-focused EVE client.
     #[serde(default = "default_true")]
     pub alerts_on_inactive_only: bool,
@@ -236,6 +246,7 @@ impl Default for LogsConfig {
             gamelog_dir: String::new(),
             show_system: true,
             show_dps: true,
+            turret_cycle_ms: default_turret_cycle_ms(),
             alerts_on_inactive_only: true,
             alert_secs: default_alert_secs(),
             alert_clear: AlertClear::UntilFocus,
@@ -432,6 +443,41 @@ fn default_window_height() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_turret_cycle_ms() -> u32 {
+    4000
+}
+
+/// Clamp a configured cycle time. 0.5 s to 20 s.
+pub fn turret_cycle(ms: u32) -> Duration {
+    Duration::from_millis(u64::from(ms.clamp(500, 20_000)))
+}
+
+/// Panel readout. Whole seconds when the value lands on one.
+pub fn format_turret_cycle(ms: u32) -> String {
+    let ms = ms.clamp(500, 20_000);
+    if ms.is_multiple_of(1000) {
+        format!("{}", ms / 1000)
+    } else if ms.is_multiple_of(100) {
+        format!("{:.1}", ms as f64 / 1000.0)
+    } else {
+        format!("{:.2}", ms as f64 / 1000.0)
+    }
+}
+
+/// Parse the panel's seconds field. Out of range or not a number stays
+/// `None`, so the last good cycle time is left alone.
+pub fn parse_turret_cycle_ms(text: &str) -> Option<u32> {
+    let value: f64 = text.trim().parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let ms = (value * 1000.0).round();
+    if !(500.0..=20_000.0).contains(&ms) {
+        return None;
+    }
+    Some(ms as u32)
 }
 
 fn default_alert_secs() -> u32 {
@@ -776,6 +822,7 @@ eve_height = 1080
         assert!(!parsed.logs.enabled);
         assert!(parsed.logs.show_system);
         assert!(parsed.logs.show_dps);
+        assert_eq!(parsed.logs.turret_cycle_ms, 4000);
         assert!(parsed.logs.alerts.fleet_invite);
         assert!(!parsed.logs.alerts.decloak);
         assert!(parsed.logs.alerts.tackle);
@@ -786,6 +833,23 @@ eve_height = 1080
         assert_eq!(parsed.display_mode, DisplayMode::Previews);
         assert_eq!(parsed.grid_columns, 2);
         assert_eq!(parsed.grid_cell_width, 160);
+    }
+
+    #[test]
+    fn turret_cycle_parse_clamps_to_the_panel_range() {
+        assert_eq!(parse_turret_cycle_ms("4"), Some(4000));
+        assert_eq!(parse_turret_cycle_ms("4.5"), Some(4500));
+        assert_eq!(parse_turret_cycle_ms("0.5"), Some(500));
+        assert_eq!(parse_turret_cycle_ms("20"), Some(20_000));
+        assert_eq!(parse_turret_cycle_ms("0.1"), None);
+        assert_eq!(parse_turret_cycle_ms("25"), None);
+        assert_eq!(parse_turret_cycle_ms("4."), Some(4000));
+        assert_eq!(parse_turret_cycle_ms("nope"), None);
+        assert_eq!(parse_turret_cycle_ms(""), None);
+        assert_eq!(format_turret_cycle(4000), "4");
+        assert_eq!(format_turret_cycle(4500), "4.5");
+        assert_eq!(turret_cycle(100).as_millis(), 500);
+        assert_eq!(turret_cycle(60_000).as_millis(), 20_000);
     }
 
     #[test]

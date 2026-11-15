@@ -250,6 +250,10 @@ pub(super) struct Panel {
     pub audio: std::sync::mpsc::Sender<()>,
     /// Buffer for the "add character" text input.
     pub new_character_buffer: String,
+    /// Turret cycle readout, in seconds. Kept as text so a half-typed
+    /// value (`4.`) is not snapped away. A parseable value in range
+    /// writes `logs.turret_cycle_ms`.
+    pub turret_cycle_text: String,
     /// When `Some(..)`, the next keypress binds to this field.
     pub capturing: Option<CaptureTarget>,
     /// Timestamp of the last edit; the debounce subscription flushes to
@@ -275,6 +279,9 @@ pub(super) struct Panel {
     /// isn't persisted separately — `preview_width`/`preview_height` are
     /// always kept in this ratio.
     pub aspect_ratio: f64,
+    /// Session-only chrome cycle. Not part of `config`, so it is off
+    /// after a restart and a toggle does not save.
+    pub chrome_test: bool,
     /// Whether to show the Restack button. False on GNOME Wayland, where
     /// Mutter forbids a client positioning windows, so restack is a no-op
     /// (see `window_manager::restack_supported`). Always true on Windows.
@@ -305,6 +312,7 @@ impl Panel {
         );
         slider_text.insert(SliderField::AlertSecs, config.logs.alert_secs.to_string());
         let aspect_ratio = aspect_ratio_of(config.preview_width, config.preview_height);
+        let turret_cycle_text = crate::config::format_turret_cycle(config.logs.turret_cycle_ms);
 
         // Hide Restack where it can't work. Only GNOME Wayland blocks
         // window positioning; everything else (Windows, X11, KWin, Sway,
@@ -324,7 +332,9 @@ impl Panel {
             slider_text,
             aspect_ratio,
             restack_supported,
+            chrome_test: false,
             new_character_buffer: String::new(),
+            turret_cycle_text,
             capturing: None,
             last_change: None,
             active_tab: Tab::Display,
@@ -467,6 +477,8 @@ pub(super) enum Message {
     AlertSecsChanged(u32),
     ChatlogDirChanged(String),
     GamelogDirChanged(String),
+    TurretCycleEdited(String),
+    ChromeTestToggled(bool),
 }
 
 fn update(panel: &mut Panel, message: Message) -> Task<Message> {
@@ -480,6 +492,10 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel.config.positions_locked = v;
             panel.live.lock().unwrap().positions_locked = v;
             panel.touch();
+        }
+        Message::ChromeTestToggled(v) => {
+            panel.chrome_test = v;
+            panel.live.lock().unwrap().chrome_test = v;
         }
         Message::RestackClicked => {
             let _ = crate::daemon::send_command("stack");
@@ -765,6 +781,15 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::ShowDpsToggled(v) => {
             panel.config.logs.show_dps = v;
             panel.touch();
+        }
+        Message::TurretCycleEdited(text) => {
+            panel.turret_cycle_text = text.clone();
+            if let Some(ms) = crate::config::parse_turret_cycle_ms(&text) {
+                if panel.config.logs.turret_cycle_ms != ms {
+                    panel.config.logs.turret_cycle_ms = ms;
+                    panel.touch();
+                }
+            }
         }
         Message::AlertsInactiveOnlyToggled(v) => {
             panel.config.logs.alerts_on_inactive_only = v;

@@ -1,10 +1,11 @@
 use crate::alert_icon::{raster_icon, shown_icon};
 use crate::config::{AlertClear, Config, LiveSettings, LogsConfig};
 use crate::cycle_state::CycleState;
-use crate::eve_logs::{AlertKind, LogLiveState};
+use crate::eve_logs::{AlertKind, CombatMeter, LogLiveState};
 use crate::preview_common::{
     dps_in_label, dps_out_label, preview_should_hide, snap_position, thumbnail_dest, title_label,
-    DragRect, DragState, DRAG_THRESHOLD_PX, HALO_PAD, SNAP_THRESHOLD_PX,
+    ChromeSample, ChromeTestClock, DragRect, DragState, DRAG_THRESHOLD_PX, HALO_PAD,
+    SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -200,6 +201,9 @@ struct PreviewWindowState {
     dps_in_label: String,
     dps_out_label: String,
     taking_damage: bool,
+    /// Side bars. Default draws nothing. Independent of `showing_dps`:
+    /// an all-miss window has no DPS numbers and still shows the track.
+    meter: CombatMeter,
     /// Click-through label window. Copied so the drag handler can move
     /// it without borrowing the manager. Owned by [`OwnedPreview`].
     overlay: HWND,
@@ -275,6 +279,10 @@ struct PreviewManager {
     /// InvalidateRect every 100ms otherwise produces a visible flicker
     /// and feels sluggish.
     list_last_names: Vec<String>,
+    /// Advances one test-chrome step every [`crate::preview_common::CHROME_TEST_HOLD`].
+    chrome_clock: ChromeTestClock,
+    /// Sample for this reconcile. `None` paints live log chrome.
+    test_chrome: Option<ChromeSample>,
     /// `(name, label, alert kind, taking damage)` last painted, so a
     /// system or icon change invalidates even when the character set didn't.
     list_last_rows: Vec<(String, String, Option<AlertKind>, bool)>,
@@ -307,7 +315,13 @@ struct ListWindowState {
 }
 
 impl PreviewManager {
+    fn sync_test_chrome(&mut self) {
+        let on = self.live.lock().unwrap().chrome_test;
+        self.test_chrome = self.chrome_clock.sample(on, Instant::now());
+    }
+
     fn reconcile(&mut self) {
+        self.sync_test_chrome();
         // Read both live toggles up front so we drop the lock before
         // any of the per-window work below grabs other mutexes.
         let (show_previews, target_mode) = {
@@ -418,13 +432,14 @@ impl PreviewManager {
                             let state = &*ptr;
                             let alert = state.alert_kind.map(|k| k.as_str()).unwrap_or("");
                             let key = format!(
-                                "{}|{}|{}|{}|{}|{}|{w}|{h}|{opacity}",
+                                "{}|{}|{}|{}|{}|{}|{}|{w}|{h}|{opacity}",
                                 state.title_label,
                                 state.showing_dps,
                                 state.dps_in_label,
                                 state.dps_out_label,
                                 alert,
-                                state.taking_damage
+                                state.taking_damage,
+                                state.meter.sig()
                             );
                             let fresh = preview.overlay.matches(&key);
                             let pixels = if fresh {
@@ -754,7 +769,7 @@ impl PreviewManager {
         }
 
         for (name, preview) in &self.previews {
-            let (system, alert, dps, taking) = if enabled {
+            let (system, alert, dps, taking, meter) = if enabled {
                 let live = self.log_live.lock().unwrap();
                 let system = if show_system {
                     live.system_for(name).map(|s| s.to_string())
@@ -764,16 +779,37 @@ impl PreviewManager {
                 let alert = live.alert_for(name, now, clear).map(|a| a.kind);
                 let dps = if show_dps { live.dps_for(name) } else { None };
                 let taking = live.taking_damage(name, now);
-                (system, alert, dps, taking)
+                let meter = if show_dps {
+                    live.meter_for(name).unwrap_or_default()
+                } else {
+                    CombatMeter::default()
+                };
+                (system, alert, dps, taking, meter)
             } else {
-                (None, None, None, false)
+                (None, None, None, false, CombatMeter::default())
+            };
+            let (alert, taking, meter) = if let Some(sample) = self.test_chrome {
+                (sample.alert, sample.taking_damage, sample.meter)
+            } else {
+                (alert, taking, meter)
             };
             let label = title_label(name, system.as_deref());
-            let (want_dps, in_l, out_l) = match dps {
-                Some(r) if !r.is_idle() => {
-                    (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
+            let (want_dps, in_l, out_l) = if let Some(sample) = self.test_chrome {
+                match (sample.dps_in, sample.dps_out) {
+                    (None, None) => (false, String::new(), String::new()),
+                    (inn, out) => (
+                        true,
+                        inn.unwrap_or("").to_string(),
+                        out.unwrap_or("").to_string(),
+                    ),
                 }
-                _ => (false, String::new(), String::new()),
+            } else {
+                match dps {
+                    Some(r) if !r.is_idle() => {
+                        (true, dps_in_label(r.incoming), dps_out_label(r.outgoing))
+                    }
+                    _ => (false, String::new(), String::new()),
+                }
             };
             unsafe {
                 let ptr = GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *mut PreviewWindowState;
@@ -785,13 +821,15 @@ impl PreviewManager {
                     || (*ptr).showing_dps != want_dps
                     || (*ptr).dps_in_label != in_l
                     || (*ptr).dps_out_label != out_l
-                    || (*ptr).taking_damage != taking;
+                    || (*ptr).taking_damage != taking
+                    || (*ptr).meter != meter;
                 (*ptr).title_label = label;
                 (*ptr).alert_kind = alert;
                 (*ptr).showing_dps = want_dps;
                 (*ptr).dps_in_label = in_l;
                 (*ptr).dps_out_label = out_l;
                 (*ptr).taking_damage = taking;
+                (*ptr).meter = meter;
                 if changed {
                     let _ = InvalidateRect(Some(preview.hwnd), None, true);
                 }
@@ -1036,6 +1074,7 @@ impl PreviewManager {
             dps_in_label: String::new(),
             dps_out_label: String::new(),
             taking_damage: false,
+            meter: CombatMeter::default(),
             overlay: text.hwnd(),
         });
         unsafe {
@@ -1812,6 +1851,8 @@ fn run_manager(
         active_id: 0,
         list_last_names: Vec::new(),
         list_last_rows: Vec::new(),
+        chrome_clock: ChromeTestClock::default(),
+        test_chrome: None,
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);

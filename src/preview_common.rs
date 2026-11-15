@@ -4,6 +4,8 @@
 //! click vs drag distinguished by pixel-distance threshold — so the
 //! geometry pieces live here once.
 
+use std::time::{Duration, Instant};
+
 /// Axis-aligned rectangle in root/screen coordinates. `right` and
 /// `bottom` are exclusive (right = left + width). Same shape as Win32
 /// `RECT`; the Windows backend converts at the call boundary.
@@ -498,6 +500,169 @@ fn scale_px(n: i32, scale: f32) -> i32 {
     (n as f32 * scale).round() as i32
 }
 
+/// Side-bar colors. Incoming and crit match the brand red and gold.
+/// Outgoing matches the config panel's green `(60, 140, 70)`. Empty
+/// segments stay dark so the track reads on a bright thumbnail.
+pub const METER_IN_RGB: (u8, u8, u8) = (196, 30, 58);
+pub const METER_OUT_RGB: (u8, u8, u8) = (60, 140, 70);
+pub const METER_CRIT_RGB: (u8, u8, u8) = (180, 155, 105);
+pub const METER_EMPTY_RGB: (u8, u8, u8) = (20, 20, 20);
+
+/// Filled-segment counts for one thumbnail. Lives here so both preview
+/// painters share the layout without a cycle through the log types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeterLevels {
+    pub incoming: u8,
+    pub outgoing: u8,
+    pub incoming_live: bool,
+    pub outgoing_live: bool,
+    pub crit: bool,
+}
+
+impl From<crate::eve_logs::CombatMeter> for MeterLevels {
+    fn from(meter: crate::eve_logs::CombatMeter) -> Self {
+        Self {
+            incoming: meter.incoming,
+            outgoing: meter.outgoing,
+            incoming_live: meter.incoming_live,
+            outgoing_live: meter.outgoing_live,
+            crit: meter.crit,
+        }
+    }
+}
+
+/// One solid rectangle inside a side bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeterPaint {
+    pub rect: GridRect,
+    pub color: (u8, u8, u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeterBars {
+    pub incoming: GridRect,
+    pub outgoing: GridRect,
+}
+
+/// Narrow bars on the left and right of `area`. `None` when the area
+/// is too small for the segments to read.
+pub fn meter_bars(area: GridRect) -> Option<MeterBars> {
+    if area.w < 48 || area.h < 36 {
+        return None;
+    }
+    let bar_w = (area.h / 22).clamp(4, 8);
+    let pad = 2;
+    let inset_y = (area.h / 10).max(4);
+    let h = area.h - inset_y * 2;
+    if h < 24 || bar_w * 2 + pad * 4 >= area.w {
+        return None;
+    }
+    Some(MeterBars {
+        incoming: GridRect {
+            x: area.x + pad,
+            y: area.y + inset_y,
+            w: bar_w,
+            h,
+        },
+        outgoing: GridRect {
+            x: area.x + area.w - pad - bar_w,
+            y: area.y + inset_y,
+            w: bar_w,
+            h,
+        },
+    })
+}
+
+/// Segment rectangles inside `bar`, index 0 at the bottom. `filled`
+/// counts up from that floor.
+pub fn meter_segments(bar: GridRect, filled: u8, segments: u8) -> Vec<(GridRect, bool)> {
+    let segments = segments.max(1);
+    let gap = 1;
+    let total_gap = gap * (segments as i32 - 1);
+    let inner = (bar.h - total_gap).max(segments as i32);
+    let seg_h = (inner / segments as i32).max(1);
+    let mut y = bar.y + bar.h;
+    let mut out = Vec::with_capacity(segments as usize);
+    let filled = filled.min(segments);
+    for i in 0..segments {
+        y -= seg_h;
+        if y < bar.y {
+            break;
+        }
+        out.push((
+            GridRect {
+                x: bar.x,
+                y,
+                w: bar.w,
+                h: seg_h,
+            },
+            i < filled,
+        ));
+        y -= gap;
+    }
+    out
+}
+
+/// Segments to paint for one thumbnail area. An idle side is omitted.
+/// A live side with zero fill still draws the empty track.
+pub fn meter_paints(area: GridRect, levels: MeterLevels) -> Vec<MeterPaint> {
+    let Some(bars) = meter_bars(area) else {
+        return Vec::new();
+    };
+    let mut paints = Vec::new();
+    if levels.incoming_live {
+        push_meter(&mut paints, bars.incoming, levels.incoming, METER_IN_RGB);
+    }
+    if levels.outgoing_live {
+        let color = if levels.crit {
+            METER_CRIT_RGB
+        } else {
+            METER_OUT_RGB
+        };
+        push_meter(&mut paints, bars.outgoing, levels.outgoing, color);
+    }
+    paints
+}
+
+fn push_meter(out: &mut Vec<MeterPaint>, bar: GridRect, filled: u8, color: (u8, u8, u8)) {
+    for (rect, on) in meter_segments(bar, filled, crate::eve_logs::METER_SEGMENTS) {
+        out.push(MeterPaint {
+            rect,
+            color: if on { color } else { METER_EMPTY_RGB },
+        });
+    }
+}
+
+/// Opaque premultiplied BGRA into `dest`. Clipped to the buffer.
+/// The Windows overlay is the only caller; Linux still unit-tests it.
+#[cfg_attr(unix, allow(dead_code))]
+pub fn fill_premul(dest: &mut [u8], dest_w: i32, dest_h: i32, rect: GridRect, color: (u8, u8, u8)) {
+    if dest_w <= 0 || dest_h <= 0 || rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    let x0 = rect.x.max(0);
+    let y0 = rect.y.max(0);
+    let x1 = (rect.x + rect.w).min(dest_w);
+    let y1 = (rect.y + rect.h).min(dest_h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let (r, g, b) = color;
+    for y in y0..y1 {
+        let row = (y as usize) * (dest_w as usize) * 4;
+        for x in x0..x1 {
+            let i = row + (x as usize) * 4;
+            if i + 3 >= dest.len() {
+                return;
+            }
+            dest[i] = b;
+            dest[i + 1] = g;
+            dest[i + 2] = r;
+            dest[i + 3] = 255;
+        }
+    }
+}
+
 /// Rectangle the thumbnail is allowed to occupy: inside the state
 /// border on every side. The name is drawn on top of this box.
 pub fn grid_thumb_bounds(cell: GridCell, inset: i32) -> GridRect {
@@ -509,8 +674,55 @@ pub fn grid_thumb_bounds(cell: GridCell, inset: i32) -> GridRect {
     GridRect { x, y, w, h }
 }
 
+/// Center crop of a source into `dest`. The destination is exactly
+/// `bounds`. A client that is not 16:9 would otherwise letterbox and
+/// leave a dark band under the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverFit {
+    pub src_x: i32,
+    pub src_y: i32,
+    pub src_w: i32,
+    pub src_h: i32,
+    pub dest: GridRect,
+}
+
+/// Cover `src_w`×`src_h` with `bounds`. The crop is centered on the
+/// source. A zero source reports `bounds` as both the crop and the dest
+/// so the caller can still fill the cell.
+pub fn fit_cover(src_w: i32, src_h: i32, bounds: GridRect) -> CoverFit {
+    if src_w <= 0 || src_h <= 0 || bounds.w <= 0 || bounds.h <= 0 {
+        return CoverFit {
+            src_x: 0,
+            src_y: 0,
+            src_w: bounds.w.max(0),
+            src_h: bounds.h.max(0),
+            dest: bounds,
+        };
+    }
+    let src_aspect = src_w as f64 / src_h as f64;
+    let box_aspect = bounds.w as f64 / bounds.h as f64;
+    let (crop_w, crop_h) = if src_aspect > box_aspect {
+        let crop_h = src_h;
+        let crop_w = ((src_h as f64) * box_aspect).round() as i32;
+        (crop_w.clamp(1, src_w), crop_h)
+    } else {
+        let crop_w = src_w;
+        let crop_h = ((src_w as f64) / box_aspect).round() as i32;
+        (crop_w, crop_h.clamp(1, src_h))
+    };
+    CoverFit {
+        src_x: (src_w - crop_w) / 2,
+        src_y: (src_h - crop_h) / 2,
+        src_w: crop_w,
+        src_h: crop_h,
+        dest: bounds,
+    }
+}
+
 /// Letterbox `src_w`×`src_h` inside `bounds`. A zero source fills the
 /// bounds. The result is centered and never larger than `bounds`.
+/// The compact grid uses [`fit_cover`]. Nothing else calls this yet.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn fit_contain(src_w: i32, src_h: i32, bounds: GridRect) -> GridRect {
     if src_w <= 0 || src_h <= 0 || bounds.w <= 0 || bounds.h <= 0 {
         return bounds;
@@ -531,6 +743,112 @@ pub fn fit_contain(src_w: i32, src_h: i32, bounds: GridRect) -> GridRect {
         y: bounds.y + (bounds.h - dh) / 2,
         w: dw.min(bounds.w),
         h: dh.min(bounds.h),
+    }
+}
+
+/// How long one test-chrome step stays up. Long enough to read an icon,
+/// short enough to walk the set without waiting.
+pub const CHROME_TEST_HOLD: Duration = Duration::from_millis(800);
+
+/// One frame of the settings test cycle. `dps_in` / `dps_out` are preview
+/// title labels. The compact grid ignores them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromeSample {
+    pub meter: crate::eve_logs::CombatMeter,
+    pub alert: Option<crate::eve_logs::AlertKind>,
+    pub taking_damage: bool,
+    pub dps_in: Option<&'static str>,
+    pub dps_out: Option<&'static str>,
+}
+
+const CHROME_TEST_ALERTS: &[crate::eve_logs::AlertKind] = &[
+    crate::eve_logs::AlertKind::FleetInvite,
+    crate::eve_logs::AlertKind::FollowWarp,
+    crate::eve_logs::AlertKind::Regroup,
+    crate::eve_logs::AlertKind::Compression,
+    crate::eve_logs::AlertKind::Decloak,
+    crate::eve_logs::AlertKind::CrystalBroke,
+    crate::eve_logs::AlertKind::ConvoRequest,
+    crate::eve_logs::AlertKind::Scramble,
+    crate::eve_logs::AlertKind::Disrupt,
+    crate::eve_logs::AlertKind::Jam,
+    crate::eve_logs::AlertKind::Bubble,
+    crate::eve_logs::AlertKind::OutOfCharges,
+    crate::eve_logs::AlertKind::CargoFull,
+    crate::eve_logs::AlertKind::MiningRange,
+];
+
+/// Bar steps, then one step per alert icon.
+pub fn chrome_test_len() -> u32 {
+    7 + CHROME_TEST_ALERTS.len() as u32
+}
+
+/// Step `index` of the test cycle. The index wraps.
+pub fn chrome_test_at(index: u32) -> ChromeSample {
+    let n = chrome_test_len().max(1);
+    let step = index % n;
+    let bars =
+        |incoming, incoming_live, outgoing, outgoing_live, crit, dps_in, dps_out| ChromeSample {
+            meter: crate::eve_logs::CombatMeter {
+                incoming,
+                outgoing,
+                incoming_live,
+                outgoing_live,
+                crit,
+            },
+            alert: None,
+            taking_damage: false,
+            dps_in: Some(dps_in),
+            dps_out: Some(dps_out),
+        };
+    match step {
+        0 => bars(4, true, 0, false, false, "↓40", "↑0"),
+        1 => bars(8, true, 0, false, false, "↓200", "↑0"),
+        2 => bars(0, false, 6, true, false, "↓0", "↑80"),
+        3 => bars(0, false, 8, true, true, "↓0", "↑120"),
+        4 => bars(0, false, 0, true, false, "↓0", "↑0"),
+        5 => bars(5, true, 5, true, false, "↓80", "↑80"),
+        6 => ChromeSample {
+            meter: crate::eve_logs::CombatMeter::default(),
+            alert: None,
+            taking_damage: true,
+            dps_in: None,
+            dps_out: None,
+        },
+        other => ChromeSample {
+            meter: crate::eve_logs::CombatMeter::default(),
+            alert: Some(CHROME_TEST_ALERTS[(other - 7) as usize]),
+            taking_damage: false,
+            dps_in: None,
+            dps_out: None,
+        },
+    }
+}
+
+/// Wall-clock stepper for the test cycle. Off resets to the first step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChromeTestClock {
+    step: u32,
+    at: Option<Instant>,
+}
+
+impl ChromeTestClock {
+    /// `None` when the toggle is off: painters keep the live chrome.
+    pub fn sample(&mut self, on: bool, now: Instant) -> Option<ChromeSample> {
+        if !on {
+            *self = Self::default();
+            return None;
+        }
+        match self.at {
+            None => self.at = Some(now),
+            Some(at) if now.saturating_duration_since(at) >= CHROME_TEST_HOLD => {
+                let n = chrome_test_len().max(1);
+                self.step = (self.step + 1) % n;
+                self.at = Some(now);
+            }
+            _ => {}
+        }
+        Some(chrome_test_at(self.step))
     }
 }
 
@@ -1191,5 +1509,191 @@ mod tests {
         assert_eq!(cinematic.y, 32);
 
         assert_eq!(fit_contain(0, 0, bounds), bounds);
+    }
+
+    #[test]
+    fn fit_cover_fills_the_cell_and_crops_the_long_axis() {
+        let cell = GridRect {
+            x: 2,
+            y: 2,
+            w: 160,
+            h: 90,
+        };
+        // Wider than 16:9 (the live 2560×1366 client): crop the sides.
+        let wide = fit_cover(2560, 1366, cell);
+        assert_eq!(wide.dest, cell);
+        assert_eq!(wide.src_h, 1366);
+        assert!(wide.src_w < 2560);
+        assert!(wide.src_x > 0);
+        assert_eq!(wide.src_y, 0);
+        assert!((wide.src_x * 2 + wide.src_w - 2560).abs() <= 1);
+
+        // Taller than the cell: crop the top and bottom.
+        let tall = fit_cover(1382, 1440, cell);
+        assert_eq!(tall.dest, cell);
+        assert_eq!(tall.src_w, 1382);
+        assert!(tall.src_h < 1440);
+        assert_eq!(tall.src_x, 0);
+        assert!(tall.src_y > 0);
+
+        let zero = fit_cover(0, 0, cell);
+        assert_eq!(zero.dest, cell);
+        assert_eq!(zero.src_w, cell.w);
+        assert_eq!(zero.src_h, cell.h);
+    }
+
+    #[test]
+    fn chrome_test_walks_bars_then_every_alert() {
+        use crate::eve_logs::AlertKind;
+
+        assert_eq!(chrome_test_at(0).meter.incoming, 4);
+        assert!(chrome_test_at(0).meter.incoming_live);
+        assert!(!chrome_test_at(0).meter.outgoing_live);
+        assert_eq!(chrome_test_at(0).dps_in, Some("↓40"));
+
+        let crit = chrome_test_at(3);
+        assert!(crit.meter.crit);
+        assert_eq!(crit.meter.outgoing, 8);
+        assert!(crit.meter.outgoing_live);
+
+        let empty = chrome_test_at(4);
+        assert!(empty.meter.outgoing_live);
+        assert_eq!(empty.meter.outgoing, 0);
+        assert!(!empty.meter.crit);
+
+        let flash = chrome_test_at(6);
+        assert!(flash.taking_damage);
+        assert!(flash.alert.is_none());
+        assert!(!flash.meter.incoming_live);
+        assert!(flash.dps_in.is_none());
+
+        let mut kinds = Vec::new();
+        for step in 0..chrome_test_len() {
+            if let Some(kind) = chrome_test_at(step).alert {
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                AlertKind::FleetInvite,
+                AlertKind::FollowWarp,
+                AlertKind::Regroup,
+                AlertKind::Compression,
+                AlertKind::Decloak,
+                AlertKind::CrystalBroke,
+                AlertKind::ConvoRequest,
+                AlertKind::Scramble,
+                AlertKind::Disrupt,
+                AlertKind::Jam,
+                AlertKind::Bubble,
+                AlertKind::OutOfCharges,
+                AlertKind::CargoFull,
+                AlertKind::MiningRange,
+            ]
+        );
+        assert_eq!(chrome_test_at(chrome_test_len()), chrome_test_at(0));
+    }
+
+    #[test]
+    fn chrome_test_clock_holds_a_step_then_advances() {
+        let mut clock = ChromeTestClock::default();
+        let t0 = Instant::now();
+        let first = clock.sample(true, t0).expect("on");
+        let held = clock
+            .sample(true, t0 + Duration::from_millis(799))
+            .expect("held");
+        assert_eq!(first, held);
+        let next = clock.sample(true, t0 + CHROME_TEST_HOLD).expect("advanced");
+        assert_eq!(next.meter.incoming, 8);
+        assert!(clock.sample(false, t0).is_none());
+        let restarted = clock.sample(true, t0).expect("restart");
+        assert_eq!(restarted, chrome_test_at(0));
+    }
+
+    #[test]
+    fn meter_bars_sit_inside_the_thumbnail() {
+        let area = GridRect {
+            x: 10,
+            y: 20,
+            w: 320,
+            h: 160,
+        };
+        let bars = meter_bars(area).expect("bars");
+        assert!(bars.incoming.x >= area.x);
+        assert!(bars.outgoing.x + bars.outgoing.w <= area.x + area.w);
+        assert!(bars.incoming.x + bars.incoming.w < bars.outgoing.x);
+        assert_eq!(bars.incoming.w, bars.outgoing.w);
+        assert_eq!(bars.incoming.y, bars.outgoing.y);
+        assert!(bars.incoming.h < area.h);
+        assert!(meter_bars(GridRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn meter_segments_fill_from_the_bottom() {
+        let bar = GridRect {
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 80,
+        };
+        let segs = meter_segments(bar, 3, 8);
+        assert_eq!(segs.len(), 8);
+        assert!(segs.iter().take(3).all(|(_, on)| *on));
+        assert!(segs.iter().skip(3).all(|(_, on)| !*on));
+        assert!(segs[0].0.y > segs[7].0.y);
+        let paints = meter_paints(
+            GridRect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 120,
+            },
+            MeterLevels {
+                incoming: 8,
+                outgoing: 2,
+                incoming_live: true,
+                outgoing_live: true,
+                crit: true,
+            },
+        );
+        assert!(paints.iter().any(|p| p.color == METER_IN_RGB));
+        assert!(paints.iter().any(|p| p.color == METER_CRIT_RGB));
+        assert!(paints.iter().any(|p| p.color == METER_EMPTY_RGB));
+        assert!(meter_paints(
+            GridRect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 120,
+            },
+            MeterLevels::default(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn fill_premul_writes_opaque_bgra_and_clips() {
+        let mut dest = vec![0u8; 4 * 4];
+        fill_premul(
+            &mut dest,
+            2,
+            2,
+            GridRect {
+                x: 1,
+                y: 1,
+                w: 4,
+                h: 4,
+            },
+            (196, 30, 58),
+        );
+        assert_eq!(&dest[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&dest[12..16], &[58, 30, 196, 255]);
     }
 }

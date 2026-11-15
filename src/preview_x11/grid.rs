@@ -22,15 +22,15 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
 use crate::alert_icon::{alert_icon_px, shown_icon};
-use crate::eve_logs::AlertKind;
+use crate::eve_logs::{AlertKind, CombatMeter};
 use crate::preview_common::{
-    fit_contain, grid_layout, grid_name_rows, grid_thumb_bounds, preview_should_hide, GridCell,
+    fit_cover, grid_layout, grid_name_rows, grid_thumb_bounds, preview_should_hide, GridCell,
     GridRect, GRID_GAP_PX, GRID_NAME_FONT_PX, GRID_OUTER_BORDER_PX, HALO_PAD,
 };
 
 use super::render::{
-    apply_scale_transform, create_halo_text_pixmap, create_icon_pixmap, jetbrains_mono,
-    pick_visual_format, xcolor,
+    apply_cover_transform, create_halo_text_pixmap, create_icon_pixmap, jetbrains_mono,
+    paint_meter_fills, pick_visual_format, xcolor,
 };
 use super::{
     opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, CHROME_DARK, NICOTINE_CREAM,
@@ -56,6 +56,7 @@ struct PaintSnap {
     icon_picture: Option<u32>,
     icon_w: u16,
     icon_h: u16,
+    meter: CombatMeter,
 }
 
 /// One redirected EVE client inside the grid. Drop unredirects the
@@ -92,6 +93,7 @@ struct GridSource {
     is_active: bool,
     taking_damage: bool,
     hide_thumb: bool,
+    meter: CombatMeter,
 }
 
 impl Drop for GridSource {
@@ -130,6 +132,7 @@ struct GridChromeEntry {
     alert_kind: Option<AlertKind>,
     taking_damage: bool,
     hide_thumb: bool,
+    meter: CombatMeter,
 }
 
 /// What the last paint drew. Refresh skips the composite when this
@@ -494,6 +497,7 @@ impl PreviewManager {
             is_active: false,
             taking_damage: false,
             hide_thumb: false,
+            meter: CombatMeter::default(),
         };
         if let Some(grid) = self.grid_window.as_mut() {
             grid.sources.push(source);
@@ -555,12 +559,17 @@ impl PreviewManager {
             .map(|g| g.sources.iter().map(|s| s.character_name.clone()).collect())
             .unwrap_or_default();
         let now = Instant::now();
-        let (enabled, show_system, clear) = {
+        let (enabled, show_system, show_dps, clear) = {
             let logs = self.logs_config.lock_recover();
-            (logs.enabled, logs.show_system, logs.alert_clear)
+            (
+                logs.enabled,
+                logs.show_system,
+                logs.show_dps,
+                logs.alert_clear,
+            )
         };
         for name in &names {
-            let (is_active, kind, taking) = {
+            let (is_active, kind, taking, meter) = {
                 let is_active = self
                     .active_character
                     .as_ref()
@@ -570,16 +579,24 @@ impl PreviewManager {
                             .iter()
                             .any(|s| s.character_name == *name && s.source_id == self.active_id)
                     });
-                let (kind, taking) = if enabled {
+                let (kind, taking, meter) = if let Some(sample) = self.test_chrome {
+                    (sample.alert, sample.taking_damage, sample.meter)
+                } else if enabled {
                     let live = self.log_live.lock_recover();
+                    let meter = if show_dps {
+                        live.meter_for(name).unwrap_or_default()
+                    } else {
+                        CombatMeter::default()
+                    };
                     (
                         live.alert_for(name, now, clear).map(|a| a.kind),
                         live.taking_damage(name, now),
+                        meter,
                     )
                 } else {
-                    (None, false)
+                    (None, false, CombatMeter::default())
                 };
-                (is_active, kind, taking)
+                (is_active, kind, taking, meter)
             };
             let hide_thumb = preview_should_hide(hide_active, is_active);
             let needs_text = self.grid_window.as_ref().is_some_and(|g| {
@@ -608,6 +625,7 @@ impl PreviewManager {
                     src.is_active = is_active;
                     src.taking_damage = taking;
                     src.hide_thumb = hide_thumb;
+                    src.meter = meter;
                 }
             }
         }
@@ -640,6 +658,7 @@ impl PreviewManager {
                     alert_kind: s.alert_kind,
                     taking_damage: s.taking_damage,
                     hide_thumb: s.hide_thumb,
+                    meter: s.meter,
                 })
                 .collect(),
             columns,
@@ -907,6 +926,7 @@ impl PreviewManager {
                     icon_picture: src.icon_picture,
                     icon_w: src.icon_w,
                     icon_h: src.icon_h,
+                    meter: src.meter,
                 })
                 .collect();
             (grid.dst_picture, grid.width, grid.height, cells)
@@ -945,21 +965,20 @@ impl PreviewManager {
         for src in &cells {
             let cell = src.cell;
             let bounds = grid_thumb_bounds(cell, layout.cell_inset);
+            let cell_box = GridRect {
+                x: cell.x,
+                y: cell.y,
+                w: cell.w,
+                h: cell.h,
+            };
             if !src.hide_thumb
                 && src.source_w > 0
                 && src.source_h > 0
-                && bounds.w > 0
-                && bounds.h > 0
+                && cell_box.w > 0
+                && cell_box.h > 0
             {
-                let fitted = fit_contain(src.source_w as i32, src.source_h as i32, bounds);
-                apply_scale_transform(
-                    &self.conn,
-                    src.src_picture,
-                    src.source_w,
-                    src.source_h,
-                    fitted.w.max(1) as u16,
-                    fitted.h.max(1) as u16,
-                )?;
+                let cover = fit_cover(src.source_w as i32, src.source_h as i32, cell_box);
+                apply_cover_transform(&self.conn, src.src_picture, cover)?;
                 self.conn.render_composite(
                     PictOp::SRC,
                     src.src_picture,
@@ -969,12 +988,25 @@ impl PreviewManager {
                     0,
                     0,
                     0,
-                    fitted.x as i16,
-                    fitted.y as i16,
-                    fitted.w.max(1) as u16,
-                    fitted.h.max(1) as u16,
+                    cell_box.x as i16,
+                    cell_box.y as i16,
+                    cell_box.w.max(1) as u16,
+                    cell_box.h.max(1) as u16,
                 )?;
             }
+
+            let reserve = if src.system_picture.is_some() {
+                layout.scrim.saturating_mul(2)
+            } else {
+                layout.scrim
+            };
+            let meter_area = GridRect {
+                x: bounds.x,
+                y: bounds.y,
+                w: bounds.w,
+                h: (bounds.h - reserve).max(1),
+            };
+            paint_meter_fills(&self.conn, dst, meter_area, src.meter)?;
 
             // Name sits on the picture, with the system on the row above
             // it when one is known. The alert icon is centered on the

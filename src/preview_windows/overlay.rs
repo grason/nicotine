@@ -16,10 +16,10 @@
 use std::sync::OnceLock;
 
 use crate::alert_icon::{alert_icon_px, raster_icon, shown_icon, ShownIcon};
-use crate::eve_logs::AlertKind;
+use crate::eve_logs::{AlertKind, CombatMeter};
 use crate::preview_common::{
-    cover_with_halo, grid_name_rows, grid_thumb_bounds, overlay_label_bands, thumbnail_dest,
-    GridCell, GridRect, DPS_SLOT_PX, HALO_PAD,
+    cover_with_halo, fill_premul, grid_name_rows, grid_thumb_bounds, meter_paints,
+    overlay_label_bands, thumbnail_dest, GridCell, GridRect, MeterPaint, DPS_SLOT_PX, HALO_PAD,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -267,6 +267,7 @@ pub(super) fn compose(
     height: i32,
     glyphs: &[Glyph],
     sprites: &[Sprite<'_>],
+    solids: &[MeterPaint],
     opacity: u8,
     clear: &[RECT],
 ) -> Vec<u8> {
@@ -285,6 +286,9 @@ pub(super) fn compose(
         return Vec::new();
     }
     let mut dest = vec![0u8; len];
+    for solid in solids {
+        fill_premul(&mut dest, width, height, solid.rect, solid.color);
+    }
     for glyph in glyphs {
         if glyph.text.is_empty() {
             continue;
@@ -409,7 +413,15 @@ pub(super) fn preview_pixels(
     }
     let sprites = sprites_of(&rasters);
     let clear = frame_rects(width, height, border);
-    compose(width, height, &glyphs, &sprites, opacity, &clear)
+    let title_h = px(TITLE_HEIGHT);
+    let meter_area = GridRect {
+        x: left,
+        y: top + title_h,
+        w: (right - left).max(1),
+        h: (bottom - top - title_h).max(1),
+    };
+    let solids = meter_paints(meter_area, state.meter.into());
+    compose(width, height, &glyphs, &sprites, &solids, opacity, &clear)
 }
 
 /// One grid cell's name plus the alert icon, if any. The name stays cream.
@@ -421,6 +433,7 @@ pub(super) struct GridLabel {
     pub system: String,
     pub kind: Option<AlertKind>,
     pub taking: bool,
+    pub meter: CombatMeter,
 }
 
 /// Cream name along the bottom of each cell, the solar system on the
@@ -440,6 +453,7 @@ pub(super) fn grid_pixels(
     let cream = colorref_rgb(super::NICOTINE_CREAM);
     let mut glyphs = Vec::new();
     let mut rasters = Vec::new();
+    let mut solids = Vec::new();
     let mut clear = frame_rects(width, height, outer_border);
     for label in labels {
         let rows = grid_name_rows(label.cell, inset, scrim, !label.system.is_empty());
@@ -461,25 +475,37 @@ pub(super) fn grid_pixels(
             font,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+        let thumb = grid_thumb_bounds(
+            GridCell {
+                index: 0,
+                x: label.cell.x,
+                y: label.cell.y,
+                w: label.cell.w,
+                h: label.cell.h,
+            },
+            inset,
+        );
         if let Some(icon) = shown_icon(label.taking, label.kind) {
-            let bounds = grid_thumb_bounds(
-                GridCell {
-                    index: 0,
-                    x: label.cell.x,
-                    y: label.cell.y,
-                    w: label.cell.w,
-                    h: label.cell.h,
-                },
-                inset,
-            );
-            if let Some(drawn) = centered_icon(icon, bounds) {
+            if let Some(drawn) = centered_icon(icon, thumb) {
                 rasters.push(drawn);
             }
         }
+        let reserve = if label.system.is_empty() {
+            scrim
+        } else {
+            scrim.saturating_mul(2)
+        };
+        let meter_area = GridRect {
+            x: thumb.x,
+            y: thumb.y,
+            w: thumb.w,
+            h: (thumb.h - reserve).max(1),
+        };
+        solids.extend(meter_paints(meter_area, label.meter.into()));
         clear.extend(cell_frame_rects(label.cell, inset));
     }
     let sprites = sprites_of(&rasters);
-    compose(width, height, &glyphs, &sprites, opacity, &clear)
+    compose(width, height, &glyphs, &sprites, &solids, opacity, &clear)
 }
 
 /// Icon centered in `bounds`. The bitmap includes a 1px transparent pad.

@@ -12,5 +12,5 @@ mod tail;
 
 pub use parse::AlertKind;
 pub use paths::resolve;
-pub use state::LogLiveState;
+pub use state::{CombatMeter, LogLiveState, METER_SEGMENTS};
 pub use tail::spawn;

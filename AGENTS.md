@@ -107,7 +107,7 @@ CLI cycle commands prefer the daemon. If it is down they take
 | `src/mouse_listener.rs` / `keyboard_listener.rs` | Linux evdev |
 | `src/pointer_nudge.rs` | Wayland uinput +1/−1 px after activate (pointer focus) |
 | `src/eve_match.rs` | `exefile.exe` process gate (title-only is not enough) |
-| `src/eve_logs/` | Chatlog/gamelog tailer: system names + inactive-client alerts |
+| `src/eve_logs/` | Chatlog/gamelog tailer: system names, alerts, damage bars |
 | `src/preview_common.rs` | Shared drag/snap geometry |
 | `src/preview_x11/` | XComposite + XRender previews + list window |
 | `src/preview_windows/` | DWM thumbnails |
@@ -182,6 +182,12 @@ can unit-test Windows-shaped logic.
     Off by default (`[logs] enabled`). Do not parse general Local chat —
     keep the `EVE System` / `(notify)` fast-reject. Preview chrome for
     systems/alerts is separate; the tailer writes `LogLiveState` only.
+    That state also carries per-character side bars: incoming damage
+    (red, left) and outgoing (green, right). Turret shots score the
+    green bar from hit quality (gold on a wreck). With no turret
+    sample, outgoing DPS (missiles, drones, smartbombs) fills it on
+    the same log2 scale as incoming, and does not turn it gold. The
+    combat poll stays 500 ms while lines arrive.
 
 11. **Brand palette** is duplicated as RGB in iced, X11 chrome, and
     Win32 GDI (red `196,30,58`, gold `180,155,105`, cream `252,250,242`,

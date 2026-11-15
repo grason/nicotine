@@ -69,10 +69,74 @@ pub enum Event {
     },
     /// One combat-log hit. Incoming = `AMOUNT from …`; outgoing =
     /// `AMOUNT to …`. Never an alert — DPS is a rate, not a flash.
+    /// `turret` is set only for a turret weapon with a hit-quality word.
+    /// Missiles, drones, and smartbombs stay `None`. They still count
+    /// in the DPS total, which fills the green bar when no turret
+    /// sample is present.
     Damage {
         incoming: bool,
         amount: f64,
+        turret: Option<TurretShot>,
     },
+    /// Outgoing turret miss (`Your … misses …`). No amount, so it must
+    /// not enter the DPS total. It does pull the application bar down.
+    TurretMiss {
+        target: String,
+    },
+}
+
+/// EVE turret hit quality, worst to best. Wrecks is the crit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitQuality {
+    Graze,
+    Glance,
+    Hit,
+    Penetrate,
+    Smash,
+    Wreck,
+}
+
+impl HitQuality {
+    pub fn weight(self) -> f64 {
+        match self {
+            HitQuality::Graze => 0.15,
+            HitQuality::Glance => 0.35,
+            HitQuality::Hit => 0.55,
+            HitQuality::Penetrate => 0.75,
+            HitQuality::Smash => 0.90,
+            HitQuality::Wreck => 1.0,
+        }
+    }
+
+    pub fn is_crit(self) -> bool {
+        matches!(self, HitQuality::Wreck)
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        if label.eq_ignore_ascii_case("grazes") {
+            Some(HitQuality::Graze)
+        } else if label.eq_ignore_ascii_case("glances off") {
+            Some(HitQuality::Glance)
+        } else if label.eq_ignore_ascii_case("hits") {
+            Some(HitQuality::Hit)
+        } else if label.eq_ignore_ascii_case("penetrates") {
+            Some(HitQuality::Penetrate)
+        } else if label.eq_ignore_ascii_case("smashes") {
+            Some(HitQuality::Smash)
+        } else if label.eq_ignore_ascii_case("wrecks") {
+            Some(HitQuality::Wreck)
+        } else {
+            None
+        }
+    }
+}
+
+/// Turret application sample parsed off a combat line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurretShot {
+    pub quality: HitQuality,
+    pub target: String,
+    pub crit: bool,
 }
 
 /// Cheap filter: skip player chat / combat spam before `parse_line`.
@@ -263,7 +327,7 @@ fn parse_local_channel(line: &str) -> Option<Event> {
     let idx = find_ignore_ascii(line, marker)?;
     let rest = line[idx + marker.len()..].trim();
     let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
-    let system = sanitize_system(rest);
+    let system = system_name(rest);
     if system.is_empty() {
         return None;
     }
@@ -279,7 +343,7 @@ fn parse_jump(line: &str) -> Option<Event> {
     let rest = line[idx + marker.len()..].trim();
     let to_idx = find_ignore_ascii(rest, " to ")?;
     let to = rest[to_idx + 4..].trim();
-    let system = sanitize_system(to);
+    let system = system_name(to);
     if system.is_empty() {
         return None;
     }
@@ -294,7 +358,7 @@ fn parse_conduit(line: &str) -> Option<Event> {
     let marker = "jumps you to";
     let idx = find_ignore_ascii(line, marker)?;
     let to = line[idx + marker.len()..].trim();
-    let system = sanitize_system(to);
+    let system = system_name(to);
     if system.is_empty() {
         return None;
     }
@@ -499,9 +563,16 @@ fn parse_combat(line: &str) -> Option<Event> {
     if stripped.is_empty() {
         return None;
     }
-    // Leading amount, then the first preposition: `from` = incoming,
-    // `to` = outgoing. Incoming lines also contain a later `to` (the
-    // victim); only the word immediately after the number counts.
+    if stripped.starts_with(|c: char| c.is_ascii_digit()) {
+        return parse_damage_hit(stripped);
+    }
+    parse_turret_miss(stripped)
+}
+
+/// Leading amount, then the first preposition: `from` = incoming,
+/// `to` = outgoing. Incoming lines also contain a later `to` (the
+/// victim); only the word immediately after the number counts.
+fn parse_damage_hit(stripped: &str) -> Option<Event> {
     let mut end = 0;
     let mut seen_digit = false;
     let mut seen_dot = false;
@@ -531,7 +602,125 @@ fn parse_combat(line: &str) -> Option<Event> {
     } else {
         return None;
     };
-    Some(Event::Damage { incoming, amount })
+    Some(Event::Damage {
+        incoming,
+        amount,
+        turret: turret_from_rest(rest),
+    })
+}
+
+/// `Name - Weapon - Quality`. Quality is the EVE word (Grazes …
+/// Wrecks). The weapon has to name a turret; a missile or drone line
+/// still produces [`Event::Damage`] with `turret: None`.
+fn turret_from_rest(rest: &str) -> Option<TurretShot> {
+    let parts: Vec<&str> = rest
+        .split(" - ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let quality = HitQuality::from_label(parts[parts.len() - 1])?;
+    let weapon = parts[parts.len() - 2];
+    if !is_turret_weapon(weapon) {
+        return None;
+    }
+    let name_blob = parts[..parts.len() - 2].join(" - ");
+    Some(TurretShot {
+        quality,
+        target: combat_target(&name_blob),
+        crit: quality.is_crit(),
+    })
+}
+
+fn combat_target(blob: &str) -> String {
+    let stripped = blob.trim();
+    let stripped = strip_leading_word(stripped, "to")
+        .or_else(|| strip_leading_word(stripped, "from"))
+        .unwrap_or(stripped);
+    if let Some(idx) = find_ignore_ascii(stripped, " to ") {
+        return stripped[idx + " to ".len()..].trim().to_string();
+    }
+    stripped.trim().to_string()
+}
+
+/// Positive list. Drones, missiles, and smartbombs do not contain
+/// these tokens, so they never become application samples.
+fn is_turret_weapon(name: &str) -> bool {
+    const TOKENS: &[&str] = &[
+        "railgun",
+        "artillery",
+        "autocannon",
+        "blaster",
+        "pulse laser",
+        "beam laser",
+        "howitzer",
+        "cannon",
+        "disintegrator",
+        "gatling",
+        "vorton",
+    ];
+    let lower = name.to_ascii_lowercase();
+    TOKENS.iter().any(|token| lower.contains(token))
+}
+
+/// `Your <weapon> misses <target>` and `Your group of <weapon> …`.
+/// Missile misses return `None`, matching the old "no amount" ignore.
+fn parse_turret_miss(stripped: &str) -> Option<Event> {
+    let rest = strip_leading_word(stripped, "Your")?;
+    let rest = if starts_word(rest, "group") {
+        let after_group = rest["group".len()..].trim_start();
+        strip_leading_word(after_group, "of")?
+    } else {
+        rest
+    };
+    let (weapon, after) = split_miss_phrase(rest)?;
+    if !is_turret_weapon(weapon) {
+        return None;
+    }
+    let target = miss_target(after);
+    if target.is_empty() {
+        return None;
+    }
+    Some(Event::TurretMiss { target })
+}
+
+fn split_miss_phrase(rest: &str) -> Option<(&str, &str)> {
+    // "barely misses" contains "misses", so the longer phrase is first.
+    for phrase in [" barely misses ", " misses "] {
+        let Some(idx) = find_ignore_ascii(rest, phrase) else {
+            continue;
+        };
+        let weapon = rest[..idx].trim();
+        let after = rest[idx + phrase.len()..].trim();
+        if !weapon.is_empty() && !after.is_empty() {
+            return Some((weapon, after));
+        }
+    }
+    None
+}
+
+fn miss_target(after: &str) -> String {
+    let head = after.split(" - ").next().unwrap_or(after).trim();
+    let head = head.trim_end_matches('.');
+    const TRAIL: &str = " completely";
+    let target = if head.len() >= TRAIL.len()
+        && head[head.len() - TRAIL.len()..].eq_ignore_ascii_case(TRAIL)
+    {
+        head[..head.len() - TRAIL.len()].trim()
+    } else {
+        head
+    };
+    target.to_string()
+}
+
+fn strip_leading_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    if starts_word(s, word) {
+        Some(s[word.len()..].trim_start())
+    } else {
+        None
+    }
 }
 
 fn starts_word(s: &str, word: &str) -> bool {
@@ -558,6 +747,17 @@ fn last_token_after_close_paren(s: &str) -> Option<&str> {
 fn sanitize_system(raw: &str) -> String {
     let stripped = strip_html(raw);
     stripped.trim_end_matches(['.', ',']).trim().to_string()
+}
+
+/// Solar-system name from a log fragment. Some channel and jump lines
+/// write the destination as `- Jita`. A name that really starts with a
+/// hyphen (`-B-DBY`, `G-AOTH`) has no space there and is left alone.
+fn system_name(raw: &str) -> String {
+    let mut name = sanitize_system(raw);
+    while let Some(rest) = name.strip_prefix("- ") {
+        name = rest.trim_start().to_string();
+    }
+    name
 }
 
 fn strip_html(s: &str) -> String {
@@ -629,6 +829,36 @@ mod tests {
         let line = ts_line("(None) Jumping from Jita to Perimeter");
         match parse_line(&line) {
             Some(Event::SystemChanged { system, .. }) => assert_eq!(system, "Perimeter"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_name_drops_a_leading_dash_prefix() {
+        let local = ts_line("EVE System > Channel changed to Local : - Jita");
+        match parse_line(&local) {
+            Some(Event::SystemChanged { system, .. }) => assert_eq!(system, "Jita"),
+            other => panic!("{other:?}"),
+        }
+        let jump = ts_line("(None) Jumping from Jita to - Perimeter");
+        match parse_line(&jump) {
+            Some(Event::SystemChanged { system, .. }) => assert_eq!(system, "Perimeter"),
+            other => panic!("{other:?}"),
+        }
+        let doubled = ts_line("EVE System > Channel changed to Local : - - New Caldari");
+        match parse_line(&doubled) {
+            Some(Event::SystemChanged { system, .. }) => assert_eq!(system, "New Caldari"),
+            other => panic!("{other:?}"),
+        }
+        // A hyphen that belongs to the name stays.
+        let hyphenated = ts_line("EVE System > Channel changed to Local : G-AOTH");
+        match parse_line(&hyphenated) {
+            Some(Event::SystemChanged { system, .. }) => assert_eq!(system, "G-AOTH"),
+            other => panic!("{other:?}"),
+        }
+        let leading = ts_line("EVE System > Channel changed to Local : -B-DBY");
+        match parse_line(&leading) {
+            Some(Event::SystemChanged { system, .. }) => assert_eq!(system, "-B-DBY"),
             other => panic!("{other:?}"),
         }
     }
@@ -838,6 +1068,7 @@ mod tests {
             Some(Event::Damage {
                 incoming: false,
                 amount,
+                turret: None,
             }) => assert!((amount - 63.0).abs() < f64::EPSILON),
             other => panic!("{other:?}"),
         }
@@ -850,7 +1081,13 @@ mod tests {
             Some(Event::Damage {
                 incoming: true,
                 amount,
-            }) => assert!((amount - 450.0).abs() < f64::EPSILON),
+                turret: Some(shot),
+            }) => {
+                assert!((amount - 450.0).abs() < f64::EPSILON);
+                assert_eq!(shot.quality, HitQuality::Hit);
+                assert_eq!(shot.target, "Bob");
+                assert!(!shot.crit);
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -866,6 +1103,7 @@ mod tests {
             Some(Event::Damage {
                 incoming: false,
                 amount,
+                turret: None,
             }) => assert!((amount - 63.0).abs() < f64::EPSILON),
             other => panic!("{other:?}"),
         }
@@ -878,6 +1116,7 @@ mod tests {
             Some(Event::Damage {
                 incoming: true,
                 amount,
+                turret: None,
             }) => assert!((amount - 12.7).abs() < 1e-6),
             other => panic!("{other:?}"),
         }
@@ -888,6 +1127,83 @@ mod tests {
         let line = ts_line("(combat) Your Light Missile misses Rifter completely");
         assert!(parse_line(&line).is_none());
         assert!(should_parse_line(&line, false));
+    }
+
+    #[test]
+    fn turret_outgoing_wreck_is_a_crit() {
+        let line = ts_line("(combat) 890 to Guristas Destroyer - 425mm Railgun II - Wrecks");
+        match parse_line(&line) {
+            Some(Event::Damage {
+                incoming: false,
+                turret: Some(shot),
+                ..
+            }) => {
+                assert_eq!(shot.quality, HitQuality::Wreck);
+                assert!(shot.crit);
+                assert_eq!(shot.target, "Guristas Destroyer");
+                assert!((shot.quality.weight() - 1.0).abs() < f64::EPSILON);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn turret_graze_and_glance() {
+        let graze = ts_line("(combat) 12 to Rat - 200mm Autocannon II - Grazes");
+        match parse_line(&graze) {
+            Some(Event::Damage {
+                turret: Some(shot), ..
+            }) => {
+                assert_eq!(shot.quality, HitQuality::Graze);
+                assert!(!shot.crit);
+            }
+            other => panic!("{other:?}"),
+        }
+        let glance = ts_line("(combat) 40 to Rat - Heavy Neutron Blaster II - Glances Off");
+        match parse_line(&glance) {
+            Some(Event::Damage {
+                turret: Some(shot), ..
+            }) => assert_eq!(shot.quality, HitQuality::Glance),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn drone_and_smartbomb_do_not_set_turret() {
+        let drone = ts_line("(combat) 25 to Guristas Destroyer - Warrior II - Hits");
+        match parse_line(&drone) {
+            Some(Event::Damage {
+                incoming: false,
+                turret: None,
+                amount,
+            }) => assert!((amount - 25.0).abs() < f64::EPSILON),
+            other => panic!("{other:?}"),
+        }
+        let bomb = ts_line("(combat) 80 to Foo - Large EMP Smartbomb II");
+        match parse_line(&bomb) {
+            Some(Event::Damage { turret: None, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn turret_miss_is_a_sample_missile_miss_is_not() {
+        let line = ts_line(
+            "(combat) Your 425mm Railgun II misses Guristas Destroyer completely - the target is too far away",
+        );
+        match parse_line(&line) {
+            Some(Event::TurretMiss { target }) => assert_eq!(target, "Guristas Destroyer"),
+            other => panic!("{other:?}"),
+        }
+        let group =
+            ts_line("(combat) Your group of 200mm Autocannon II barely misses Rifter completely.");
+        match parse_line(&group) {
+            Some(Event::TurretMiss { target }) => assert_eq!(target, "Rifter"),
+            other => panic!("{other:?}"),
+        }
+        let missile =
+            ts_line("(combat) Your group of Scourge Heavy Missile misses Rifter completely");
+        assert!(parse_line(&missile).is_none());
     }
 
     #[test]

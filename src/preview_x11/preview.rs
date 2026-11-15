@@ -21,11 +21,12 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
+use crate::eve_logs::CombatMeter;
 use crate::preview_common::{overlay_label_bands, thumbnail_dest, GridRect, DPS_SLOT_PX, HALO_PAD};
 
 use super::render::{
-    apply_scale_transform, create_halo_text_pixmap, jetbrains_mono, pick_visual_format,
-    thumbnail_size, xcolor,
+    apply_scale_transform, create_halo_text_pixmap, jetbrains_mono, paint_meter_fills,
+    pick_visual_format, thumbnail_size, xcolor,
 };
 use super::{
     opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, BORDER_WIDTH, CHROME_DARK,
@@ -127,6 +128,8 @@ pub(super) struct OwnedPreview {
     /// Incoming-hit flash. Lights the chrome red on inactive clients
     /// for `INCOMING_FLASH` after the last incoming combat line.
     pub(super) taking_damage: bool,
+    /// Side bars. Default draws nothing.
+    pub(super) meter: CombatMeter,
     /// Current window dimensions. Updated on live-size apply (panel
     /// slider drags) and reflected in the next chrome paint + thumbnail
     /// transform.
@@ -452,6 +455,7 @@ impl PreviewManager {
             dps_out_w: 0,
             dps_out_h: 0,
             taking_damage: false,
+            meter: CombatMeter::default(),
             width: init_w,
             height: init_h,
             source_w: geom.width,
@@ -514,6 +518,15 @@ impl PreviewManager {
             dest_w,
             dest_h,
         )?;
+
+        let title_h = TITLE_STRIP_HEIGHT as i32;
+        let meter_area = GridRect {
+            x: left,
+            y: top + title_h,
+            w: (right - left).max(1),
+            h: (bottom - top - title_h).max(1),
+        };
+        paint_meter_fills(conn, dst, meter_area, preview.meter)?;
 
         self.paint_preview_labels(preview)?;
 

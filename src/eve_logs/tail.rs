@@ -15,7 +15,7 @@ use crate::cycle_state::CycleState;
 use super::identify::newest_logs_by_character;
 use super::parse::{decode_log_chunk, parse_line, should_parse_line, AlertKind, Event};
 use super::paths::resolve;
-use super::state::{ActiveAlert, DpsTracker, LogLiveState};
+use super::state::{ActiveAlert, ApplicationTracker, DpsTracker, LogLiveState};
 
 const FAST_POLL: Duration = Duration::from_millis(500);
 const SLOW_POLL: Duration = Duration::from_millis(1000);
@@ -56,6 +56,7 @@ fn run(
     let mut files: HashMap<PathBuf, FileState> = HashMap::new();
     let mut clocks: HashMap<String, LocationClock> = HashMap::new();
     let mut dps = DpsTracker::default();
+    let mut guns = ApplicationTracker::default();
     let mut last_scan = Instant::now()
         .checked_sub(DIR_RESCAN)
         .unwrap_or_else(Instant::now);
@@ -73,7 +74,10 @@ fn run(
                 println!("Log monitor stopped");
                 files.clear();
                 dps = DpsTracker::default();
-                live.lock().unwrap().dps.clear();
+                guns = ApplicationTracker::default();
+                let mut live = live.lock().unwrap();
+                live.dps.clear();
+                live.meters.clear();
             }
             last_enabled = enabled;
         }
@@ -104,7 +108,15 @@ fn run(
                             continue;
                         };
                         had_relevant = true;
-                        apply_event(&state.character, event, &cfg, &mut clocks, &mut dps, &live);
+                        apply_event(
+                            &state.character,
+                            event,
+                            &cfg,
+                            &mut clocks,
+                            &mut dps,
+                            &mut guns,
+                            &live,
+                        );
                     }
                 }
                 Err(e) => debug_log(format_args!("log tail {}: {e}", state.path.display())),
@@ -116,6 +128,11 @@ fn run(
             let mut g = live.lock().unwrap();
             g.prune_expired(now, cfg.alert_clear);
             dps.flush_into(&mut g, now);
+            guns.flush_into(
+                &mut g,
+                now,
+                crate::config::turret_cycle(cfg.turret_cycle_ms),
+            );
         }
 
         if had_relevant {
@@ -283,19 +300,38 @@ fn apply_event(
     cfg: &LogsConfig,
     clocks: &mut HashMap<String, LocationClock>,
     dps: &mut DpsTracker,
+    guns: &mut ApplicationTracker,
     live: &Arc<Mutex<LogLiveState>>,
 ) {
     match event {
         Event::SystemChanged { system, timestamp } => {
             apply_system(character, system, timestamp, clocks, live);
         }
-        Event::Damage { incoming, amount } => {
+        Event::Damage {
+            incoming,
+            amount,
+            turret,
+        } => {
             let now = Instant::now();
             if incoming {
                 live.lock().unwrap().stamp_incoming(character, now);
             }
             if cfg.show_dps {
                 dps.add(character, incoming, amount, now);
+                if let Some(shot) = turret.filter(|_| !incoming) {
+                    guns.add_outgoing(
+                        character,
+                        &shot.target,
+                        shot.quality.weight(),
+                        shot.crit,
+                        now,
+                    );
+                }
+            }
+        }
+        Event::TurretMiss { target } => {
+            if cfg.show_dps {
+                guns.add_outgoing(character, &target, 0.0, false, Instant::now());
             }
         }
         Event::Alert { kind, text } => {

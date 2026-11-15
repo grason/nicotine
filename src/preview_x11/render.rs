@@ -11,12 +11,15 @@ use std::sync::OnceLock;
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{
     self, Color as RenderColor, ConnectionExt as _, CreatePictureAux as RenderCreatePictureAux,
-    Transform,
+    PictOp, Transform,
 };
-use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, ImageFormat, Window};
+use x11rb::protocol::xproto::{
+    ConnectionExt as _, CreateGCAux, ImageFormat, Rectangle as XRectangle, Window,
+};
 use x11rb::rust_connection::RustConnection;
 
-use crate::preview_common::{cover_with_halo, HALO_PAD};
+use crate::eve_logs::CombatMeter;
+use crate::preview_common::{cover_with_halo, meter_paints, CoverFit, GridRect, HALO_PAD};
 
 use super::BORDER_WIDTH;
 
@@ -30,6 +33,38 @@ pub(super) fn fixed(value: f64) -> i32 {
 /// Convert (R, G, B) in 0–255 to an XRender Color. XRender colors are
 /// 16-bit per channel; multiply 8-bit by 257 to span 0..0xFFFF without
 /// fractional drift (257 = 0x101 so 0xFF * 257 = 0xFFFF exactly).
+/// Segmented side bars. Empty when both sides are idle or the area is
+/// too small. One fill per color.
+pub(super) fn paint_meter_fills(
+    conn: &RustConnection,
+    dst: u32,
+    area: GridRect,
+    meter: CombatMeter,
+) -> Result<()> {
+    let paints = meter_paints(area, meter.into());
+    if paints.is_empty() {
+        return Ok(());
+    }
+    let mut batches: Vec<((u8, u8, u8), Vec<XRectangle>)> = Vec::new();
+    for paint in paints {
+        let rect = XRectangle {
+            x: paint.rect.x as i16,
+            y: paint.rect.y as i16,
+            width: paint.rect.w.max(0) as u16,
+            height: paint.rect.h.max(0) as u16,
+        };
+        if let Some((_, rects)) = batches.iter_mut().find(|(color, _)| *color == paint.color) {
+            rects.push(rect);
+        } else {
+            batches.push((paint.color, vec![rect]));
+        }
+    }
+    for (color, rects) in batches {
+        conn.render_fill_rectangles(PictOp::SRC, dst, xcolor(color, 0xffff), &rects)?;
+    }
+    Ok(())
+}
+
 pub(super) fn xcolor(rgb: (u8, u8, u8), alpha: u16) -> RenderColor {
     RenderColor {
         red: (rgb.0 as u16) * 257,
@@ -103,6 +138,31 @@ pub(super) fn apply_scale_transform(
     conn.render_set_picture_transform(src_picture, transform)?;
     // Bilinear filtering on the downscale — Nearest is jaggy at typical
     // ~10× ratios.
+    conn.render_set_picture_filter(src_picture, b"bilinear", &[])?;
+    Ok(())
+}
+
+/// Map the destination cell onto a center crop of the source. The
+/// transform is inverse: dest pixel (0, 0) samples `(src_x, src_y)`.
+pub(super) fn apply_cover_transform(
+    conn: &RustConnection,
+    src_picture: u32,
+    cover: CoverFit,
+) -> Result<()> {
+    let dest_w = cover.dest.w.max(1) as f64;
+    let dest_h = cover.dest.h.max(1) as f64;
+    let transform = Transform {
+        matrix11: fixed(cover.src_w.max(1) as f64 / dest_w),
+        matrix12: 0,
+        matrix13: fixed(cover.src_x as f64),
+        matrix21: 0,
+        matrix22: fixed(cover.src_h.max(1) as f64 / dest_h),
+        matrix23: fixed(cover.src_y as f64),
+        matrix31: 0,
+        matrix32: 0,
+        matrix33: XFIXED_ONE,
+    };
+    conn.render_set_picture_transform(src_picture, transform)?;
     conn.render_set_picture_filter(src_picture, b"bilinear", &[])?;
     Ok(())
 }

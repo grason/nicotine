@@ -261,6 +261,13 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.positions_locked)
             .label("Lock positions (drag disabled on previews, grid, and list)")
             .on_toggle(Message::LockToggled),
+        checkbox(panel.chrome_test)
+            .label("Cycle test chrome")
+            .on_toggle(Message::ChromeTestToggled),
+        caption(
+            "Steps through damage bars and alert icons on the compact grid and on preview \
+             windows. Not saved. The client list stays on live alerts."
+        ),
     ]
     .spacing(8);
 
@@ -459,9 +466,10 @@ fn alerts_section(panel: &Panel) -> Element<'_, Message> {
         section_header("Log Monitoring"),
         caption(
             "Read-only tail of EVE Chatlogs and Gamelogs. Preview titles show Name - System, \
-             incoming / outgoing DPS on the left and right, and a red flash and crossed swords \
-             when that client takes damage. Event icons sit on the preview, separate from DPS. \
-             Nothing is written back into the game."
+             incoming / outgoing DPS on the title, a red bar on the left of each thumbnail and \
+             a green bar on the right, and a red flash and crossed swords when that client \
+             takes damage. Event icons sit on the preview, separate from the bars. Nothing is \
+             written back into the game."
         ),
         checkbox(logs.enabled)
             .label("Enable log monitoring")
@@ -470,8 +478,21 @@ fn alerts_section(panel: &Panel) -> Element<'_, Message> {
             .label("Show solar system on preview titles, the client list, and the compact grid")
             .on_toggle(Message::ShowSystemToggled),
         checkbox(logs.show_dps)
-            .label("Show incoming / outgoing DPS on preview titles")
+            .label("Show incoming / outgoing damage on previews")
             .on_toggle(Message::ShowDpsToggled),
+        caption(
+            "Numbers on the title. A red bar on the left of each thumbnail for damage taken, \
+             and a green bar on the right. Guns fill that bar from how well they apply, and a \
+             wrecking hit turns it gold. Missiles, drones, and smartbombs fill it from outgoing \
+             damage on the same scale, and do not turn it gold. A new target clears the gun bar."
+        ),
+        text("Turret cycle (seconds)")
+            .size(CAPTION_SIZE)
+            .color(NICOTINE_BLACK),
+        text_input("4", &panel.turret_cycle_text)
+            .on_input(Message::TurretCycleEdited)
+            .width(Length::Fixed(80.0)),
+        caption("About four cycles fill the green bar. 4 is a typical medium gun."),
         checkbox(logs.alerts_on_inactive_only)
             .label("Event icons on inactive clients only")
             .on_toggle(Message::AlertsInactiveOnlyToggled),
